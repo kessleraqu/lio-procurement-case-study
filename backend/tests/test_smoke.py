@@ -825,3 +825,26 @@ if __name__ == "__main__":
     test_org_settings_required_fields()
     test_org_settings_admin_only()
     print("ALL SMOKE TESTS PASSED")
+
+
+def test_catalog_alternatives_reach_the_approver():
+    admin = client.post(
+        "/auth/signin", json={"email": "admin@acme.com", "password": "demo1234"}
+    ).json()["access_token"]
+    with TestingSession() as s:
+        article = s.scalar(select(Article).where(Article.article_number == "HUD-00001"))
+    payload = {
+        "requestorName": "Alex Admin", "titleShortDescription": "Docking stations",
+        "vendorName": "Random Vendor", "commodityGroupId": 29, "totalCost": 700.0,
+        "orderLines": [{"positionDescription": "USB-C dock", "unitPrice": 350, "amount": 2,
+                        "unit": "piece", "totalPrice": 700}],
+        "catalogAlternatives": [{"lineIndex": 0, "articleIds": [str(article.id)]}],
+    }
+    created = client.post("/requests", json=payload, headers=_auth(admin)).json()
+
+    [alt] = created["catalog_alternatives"]
+    assert alt["quoted_unit_price"] == 350
+    assert alt["options"][0]["article_number"] == "HUD-00001"
+    assert alt["options"][0]["supplier_name"] == "Hudson Systems Inc."
+    activity = client.get(f"/requests/{created['id']}/activity", headers=_auth(admin)).json()
+    assert any(a["action"] == "catalog_alternatives" for a in activity)

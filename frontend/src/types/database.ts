@@ -81,9 +81,25 @@ export type OrderLine = {
 // Helper Types for Joined Queries
 // ============================================================================
 
+// Negotiated catalog articles that were suggested when the request was created
+// (snapshot, prices as at that time) — shown to the approver.
+export type CatalogAlternative = {
+  line_description: string;
+  quoted_unit_price: number;
+  unit: string;
+  options: {
+    supplier_name: string;
+    article_number: string;
+    description: string;
+    unit_price: number;
+    unit: string;
+  }[];
+};
+
 export type ProcurementRequestWithDetails = ProcurementRequest & {
   order_lines: OrderLine[];
   commodity_groups: CommodityGroup | null;
+  catalog_alternatives?: CatalogAlternative[] | null;
 };
 
 export type OrganizationWithRole = Organization & {

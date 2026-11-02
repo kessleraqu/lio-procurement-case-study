@@ -15,6 +15,8 @@ interface OrderLine {
   totalPrice: number;
   // Discount (negative) / surcharge (positive) from the quote, kept on edits.
   priceAdjustmentPercent?: number | null;
+  // Negotiated catalog articles for this line (shown, never applied automatically).
+  suggestions?: api.ArticleSuggestion[];
 }
 
 // Rounding slack when comparing money amounts.
@@ -59,6 +61,35 @@ export default function NewRequestPage() {
   const [quoteTotal, setQuoteTotal] = useState<number | null>(null);
   // Options the vendor offered instead of ordered items (not in the quote's total).
   const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
+
+  const [checkingCatalog, setCheckingCatalog] = useState(false);
+
+  // Look up negotiated catalog prices for the given lines. Suggestions are
+  // optional: a failure never blocks the request.
+  const checkCatalog = async (
+    lines: OrderLine[],
+    vendor: { vendorName?: string; vendorTaxId?: string }
+  ) => {
+    const withText = lines.filter((line) => line.positionDescription.trim());
+    if (withText.length === 0) return;
+    setCheckingCatalog(true);
+    try {
+      const { suggestions } = await api.articles.suggest(
+        withText.map(({ positionDescription, unitPrice, amount, unit }) => ({
+          description: positionDescription, unitPrice, amount, unit,
+        })),
+        vendor
+      );
+      const byLine = new Map(withText.map((line, i) => [line, suggestions[i] ?? []]));
+      setOrderLines((current) =>
+        current.map((line) => (byLine.has(line) ? { ...line, suggestions: byLine.get(line) } : line))
+      );
+    } catch (err) {
+      console.error('Catalog check failed:', err);
+    } finally {
+      setCheckingCatalog(false);
+    }
+  };
 
   const { data: orgSettings } = useQuery({
     queryKey: ['organization-settings'],
@@ -170,6 +201,10 @@ export default function NewRequestPage() {
       setWarning(warnings.join('\n'));
 
       setSuccess('✓ PDF extracted successfully! Review and submit.');
+      void checkCatalog(extracted.orderLines || [], {
+        vendorName: extracted.vendorName ?? undefined,
+        vendorTaxId: extracted.vatId ?? undefined,
+      });
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       console.error('Extraction error:', err);
@@ -198,6 +233,9 @@ export default function NewRequestPage() {
   const updateOrderLine = (index: number, field: keyof OrderLine, value: string | number) => {
     const updated = [...orderLines];
     updated[index] = { ...updated[index], [field]: value };
+    if (field === 'positionDescription') {
+      updated[index].suggestions = undefined; // no longer about this item
+    }
     
     // Auto-calculate total price (keeping the quote's discount/surcharge)
     if (field === 'unitPrice' || field === 'amount' || field === 'priceAdjustmentPercent') {
@@ -253,6 +291,12 @@ export default function NewRequestPage() {
         orderLines: orderLines.map(({ positionDescription, unitPrice, amount, unit, totalPrice }) => ({
           positionDescription, unitPrice, amount, unit, totalPrice,
         })),
+        // Pass on what the requester was shown, so the approver sees it too.
+        catalogAlternatives: orderLines.flatMap((line, lineIndex) =>
+          line.suggestions?.length
+            ? [{ lineIndex, articleIds: line.suggestions.map((s) => s.article_id) }]
+            : []
+        ),
       });
 
       // Attach the original PDF (if one was uploaded) so it shows on the detail page.
@@ -439,9 +483,20 @@ export default function NewRequestPage() {
         <div className="lio-card p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold tracking-tight text-ink">Order Lines *</h2>
-            <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
-              + Add Line
-            </Button>
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                onClick={() => checkCatalog(orderLines, { vendorName, vendorTaxId: vatId })}
+                variant="outline"
+                size="sm"
+                disabled={checkingCatalog || orderLines.length === 0}
+              >
+                {checkingCatalog ? 'Checking catalog…' : 'Check negotiated prices'}
+              </Button>
+              <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
+                + Add Line
+              </Button>
+            </div>
           </div>
 
           {orderLines.length === 0 ? (
@@ -530,6 +585,49 @@ export default function NewRequestPage() {
                       placeholder="0"
                     />
                   </div>
+
+                  {line.suggestions && line.suggestions.length > 0 && (
+                    <div className="mt-3 rounded-lg border border-accent/40 bg-accent-soft/20 p-3">
+                      <p className="text-sm font-medium text-ink">
+                        Similar products in your catalog (negotiated prices)
+                      </p>
+                      <ul className="mt-1 space-y-1">
+                        {line.suggestions.map((s) => {
+                          const difference = s.unit_price - line.unitPrice;
+                          return (
+                            <li key={s.article_id} className="text-sm text-gray-700">
+                              {s.same_vendor && (
+                                <span className="mr-2 rounded bg-green-100 px-1.5 py-0.5 text-xs font-medium text-green-800">
+                                  This vendor
+                                </span>
+                              )}
+                              <span className="font-medium">{s.supplier_name}</span> ·{' '}
+                              {s.description} ({s.article_number}) ·{' '}
+                              <span className="font-medium">
+                                {formatMoney(s.unit_price)}/{s.unit}
+                              </span>
+                              {s.same_unit && line.unitPrice > 0 && (
+                                <span className="text-gray-500">
+                                  {' '}
+                                  vs {formatMoney(line.unitPrice)} on this quote (
+                                  {difference < 0 ? '−' : '+'}
+                                  {formatMoney(Math.abs(difference))}/{s.unit})
+                                </span>
+                              )}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                      <p className="mt-1 text-xs text-gray-500">
+                        Review before switching: check the product is equivalent. To use a
+                        negotiated price, raise this request with that supplier as the vendor
+                        {line.suggestions.some((s) => s.same_vendor)
+                          ? ', or ask this vendor to apply its agreed price'
+                          : ''}
+                        .
+                      </p>
+                    </div>
+                  )}
 
                   <div className="mt-2 flex items-center justify-between gap-4">
                     <span className="text-sm text-amber-800">

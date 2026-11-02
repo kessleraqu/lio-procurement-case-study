@@ -22,8 +22,10 @@ def _close(a: float, b: float) -> bool:
     return abs(a - b) <= max(0.05, abs(b) * 0.001)
 
 
-def _company_key(name: str | None) -> str:
-    normalized = _LEGAL_SUFFIXES.sub("", (name or "").lower())
+def company_key(name: str | None) -> str:
+    """Company name without legal suffix, case or punctuation (for matching)."""
+    # Drop dots first so abbreviations like "L.P." or "Inc." match their suffix.
+    normalized = _LEGAL_SUFFIXES.sub("", (name or "").lower().replace(".", ""))
     return re.sub(r"[^a-z0-9]", "", normalized)
 
 
@@ -56,7 +58,7 @@ def find_issues(quote: Quote) -> list[Issue]:
     """Inconsistencies in the extraction, phrased so the model (and a user) can act on them."""
     issues: list[Issue] = []
 
-    vendor, customer = _company_key(quote.vendor_name), _company_key(quote.customer_name)
+    vendor, customer = company_key(quote.vendor_name), company_key(quote.customer_name)
     if vendor and customer and (vendor in customer or customer in vendor):
         issues.append(Issue(
             "vendor_is_customer",

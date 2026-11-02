@@ -102,6 +102,17 @@ export default function ApprovalsPage() {
                     {request.vendor_name}
                     {request.commodity_groups ? ` · ${request.commodity_groups.name}` : ''}
                   </p>
+                  {request.catalog_alternatives?.map((alt) => {
+                    const best = [...alt.options].sort((a, b) => a.unit_price - b.unit_price)[0];
+                    return (
+                      <p key={alt.line_description} className="text-sm text-amber-800 mt-1">
+                        Catalog alternative for &ldquo;{alt.line_description}&rdquo;:{' '}
+                        {best.supplier_name} ${best.unit_price.toFixed(2)}/{best.unit} vs $
+                        {alt.quoted_unit_price.toFixed(2)}/{alt.unit} quoted
+                        {alt.options.length > 1 ? ` (+${alt.options.length - 1} more)` : ''}
+                      </p>
+                    );
+                  })}
                 </div>
                 <div className="text-lg font-semibold text-ink whitespace-nowrap">
                   ${(request.total_cost || 0).toLocaleString('en-US', { minimumFractionDigits: 2 })}

@@ -71,6 +71,8 @@ export interface CreateRequestInput {
   totalCost: number;
   department: string;
   orderLines: OrderLineInput[];
+  // Catalog articles the form suggested per line, so the approver sees them.
+  catalogAlternatives?: { lineIndex: number; articleIds: string[] }[];
 }
 
 export interface UpdateRequestInput {
@@ -334,7 +336,31 @@ export const articles = {
   count(): Promise<{ count: number }> {
     return apiFetch('/articles/count');
   },
+
+  // Negotiated catalog articles matching each line (one list per line, in order).
+  suggest(
+    lines: { description: string; unitPrice?: number; amount?: number; unit?: string }[],
+    vendor?: { vendorName?: string; vendorTaxId?: string }
+  ): Promise<{ suggestions: ArticleSuggestion[][] }> {
+    return apiFetch('/articles/suggestions', { body: { lines, ...vendor } });
+  },
 };
+
+export interface ArticleSuggestion {
+  article_id: string;
+  article_number: string;
+  description: string;
+  supplier_name: string;
+  unit_price: number;
+  unit: string;
+  quantity: number;
+  // The model's view; the requester always reviews equivalence.
+  match: 'same' | 'comparable';
+  // Negotiated with the request's own vendor (the quote should use this price).
+  same_vendor: boolean;
+  // Priced in the same unit as the line, so the prices can be compared.
+  same_unit: boolean;
+}
 
 // ============================================================================
 // PDF + extraction

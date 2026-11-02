@@ -24,6 +24,7 @@ from app.schemas.requests import (
     RequestUpdate,
     StatusUpdate,
 )
+from app.services.catalog_matching import snapshot_alternatives
 from app.services.uploads import read_pdf_upload
 
 router = APIRouter(prefix="/requests", tags=["requests"])
@@ -209,9 +210,24 @@ def create_request(
         )
         for index, line in enumerate(payload.order_lines)
     ]
+    alternatives = snapshot_alternatives(
+        db, membership.organization_id, payload.order_lines, payload.catalog_alternatives or []
+    )
+    request.catalog_alternatives = alternatives or None
     db.add(request)
     db.flush()
     _log_activity(db, request.id, membership.user_id, "created", "Request created")
+    if alternatives:
+        count = len(alternatives)
+        _log_activity(
+            db,
+            request.id,
+            membership.user_id,
+            "catalog_alternatives",
+            f"Negotiated catalog alternatives were available for {count} "
+            f"line{'s' if count > 1 else ''}",
+            {"lines": [a["line_description"] for a in alternatives]},
+        )
     db.commit()
 
     request = _get_org_request(db, request.id, membership.organization_id)

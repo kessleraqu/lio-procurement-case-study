@@ -276,6 +276,34 @@ export default function RequestDetailPage() {
             </div>
           </div>
 
+          {request.catalog_alternatives && request.catalog_alternatives.length > 0 && (
+            <div className="lio-card p-6">
+              <h2 className="text-lg font-semibold tracking-tight text-ink mb-1">
+                Negotiated catalog alternatives
+              </h2>
+              <p className="text-sm text-ink/55 mb-4">
+                Shown to the requester when the request was created (prices at that time).
+              </p>
+              <div className="space-y-3">
+                {request.catalog_alternatives.map((alt) => (
+                  <div key={alt.line_description}>
+                    <p className="text-sm font-medium text-ink">
+                      {alt.line_description} — quoted {usd(alt.quoted_unit_price)}/{alt.unit}
+                    </p>
+                    <ul className="mt-1 space-y-0.5">
+                      {alt.options.map((o) => (
+                        <li key={o.article_number} className="text-sm text-ink/70">
+                          {o.supplier_name} · {o.description} ({o.article_number}) ·{' '}
+                          {usd(o.unit_price)}/{o.unit}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="lio-card p-6">
             <h2 className="text-lg font-semibold tracking-tight text-ink mb-4">Activity</h2>
             <ol className="relative border-l border-line ml-2">

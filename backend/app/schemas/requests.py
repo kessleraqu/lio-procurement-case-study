@@ -20,6 +20,13 @@ class OrderLineIn(BaseModel):
     total_price: float = Field(alias="totalPrice")
 
 
+class CatalogAlternativesIn(BaseModel):
+    """Catalog articles the form suggested for one order line (by position)."""
+
+    line_index: int = Field(alias="lineIndex", ge=0)
+    article_ids: list[uuid.UUID] = Field(alias="articleIds", max_length=10)
+
+
 class RequestCreate(BaseModel):
     requestor_name: str = Field(alias="requestorName")
     title: str = Field(alias="titleShortDescription")
@@ -29,6 +36,9 @@ class RequestCreate(BaseModel):
     total_cost: float = Field(alias="totalCost")
     department: str | None = None
     order_lines: list[OrderLineIn] = Field(alias="orderLines", min_length=1)
+    catalog_alternatives: list[CatalogAlternativesIn] | None = Field(
+        default=None, alias="catalogAlternatives"
+    )
 
 
 class RequestUpdate(BaseModel):
@@ -106,6 +116,9 @@ class RequestOut(BaseModel):
     approved_by: uuid.UUID | None
     approved_at: datetime | None
     total_cost: float | None
+    # [{line_description, quoted_unit_price, unit, options: [{supplier_name,
+    #   article_number, description, unit_price, unit}]}] — see snapshot_alternatives
+    catalog_alternatives: list[dict] | None = None
     created_at: datetime
     updated_at: datetime
     order_lines: list[OrderLineOut]
