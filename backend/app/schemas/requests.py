@@ -39,6 +39,11 @@ class RequestCreate(BaseModel):
     catalog_alternatives: list[CatalogAlternativesIn] | None = Field(
         default=None, alias="catalogAlternatives"
     )
+    # The group the AI suggested, if any — a different choice is logged as a
+    # correction so admins can spot missing booking rules.
+    suggested_commodity_group_id: int | None = Field(
+        default=None, alias="suggestedCommodityGroupId"
+    )
 
 
 class RequestUpdate(BaseModel):

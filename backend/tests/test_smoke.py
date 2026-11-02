@@ -731,7 +731,8 @@ def test_org_settings_required_fields():
     # Default settings: nothing extra required.
     r = client.get("/organizations/me/settings", headers=_auth(token))
     assert r.status_code == 200
-    assert r.json() == {"required_fields": []}
+    assert r.json() == {"required_fields": [], "commodity_rules": [],
+                        "correction_alert_threshold": 3}
 
     base_payload = {
         "requestorName": "S", "titleShortDescription": "T", "vendorName": "V",
@@ -848,3 +849,82 @@ def test_catalog_alternatives_reach_the_approver():
     assert alt["options"][0]["supplier_name"] == "Hudson Systems Inc."
     activity = client.get(f"/requests/{created['id']}/activity", headers=_auth(admin)).json()
     assert any(a["action"] == "catalog_alternatives" for a in activity)
+
+
+def test_organization_groups_and_rules_are_tenant_scoped():
+    acme = client.post("/auth/signin", json={"email": "admin@acme.com",
+                                             "password": "demo1234"}).json()["access_token"]
+    walmart = client.post("/auth/signin", json={"email": "admin@walmart.com",
+                                                "password": "demo1234"}).json()["access_token"]
+    acme_groups = {g["name"]: g["id"] for g in
+                   client.get("/commodity-groups", headers=_auth(acme)).json()}
+    walmart_names = {g["name"] for g in
+                     client.get("/commodity-groups", headers=_auth(walmart)).json()}
+    office_supplies = acme_groups["Office Supplies"]
+    assert "Office Supplies" not in walmart_names
+
+    # Another tenant can neither book on Acme's group nor point a rule at it.
+    payload = {
+        "requestorName": "W", "titleShortDescription": "Paper", "vendorName": "V",
+        "commodityGroupId": office_supplies, "totalCost": 10.0,
+        "orderLines": [{"positionDescription": "Paper", "unitPrice": 10, "amount": 1,
+                        "unit": "pack", "totalPrice": 10}],
+    }
+    assert client.post("/requests", json=payload, headers=_auth(walmart)).status_code == 422
+    assert client.post("/requests", json=payload, headers=_auth(acme)).status_code == 201
+    r = client.patch("/organizations/me/settings", headers=_auth(walmart), json={
+        "commodity_rules": [{"applies_to": "paper", "commodity_group_id": office_supplies}]})
+    assert r.status_code == 422
+
+    # Saving only required_fields (as the Organization page does) keeps the rules.
+    rules = client.get("/organizations/me/settings", headers=_auth(acme)).json()[
+        "commodity_rules"]
+    assert {r["applies_to"] for r in rules} == {"cable ties", "printer toner",
+                                                "software subscriptions"}
+    r = client.patch("/organizations/me/settings", headers=_auth(acme),
+                     json={"required_fields": []})
+    assert r.status_code == 200 and r.json()["commodity_rules"] == rules
+
+
+def test_repeated_group_corrections_are_shown_to_admins():
+    admin = client.post("/auth/signin", json={"email": "admin@acme.com",
+                                              "password": "demo1234"}).json()["access_token"]
+    requester = client.post("/auth/signin", json={"email": "requester@acme.com",
+                                                  "password": "demo1234"}).json()["access_token"]
+
+    def create(title, suggested, chosen):
+        payload = {
+            "requestorName": "R", "titleShortDescription": title, "vendorName": "V",
+            "commodityGroupId": chosen, "suggestedCommodityGroupId": suggested,
+            "totalCost": 50.0,
+            "orderLines": [{"positionDescription": title, "unitPrice": 50, "amount": 1,
+                            "unit": "piece", "totalPrice": 50}],
+        }
+        assert client.post("/requests", json=payload, headers=_auth(requester)).status_code == 201
+
+    # AI suggested 22 (Printing Costs), requester chose 30 (IT Services): 3 times.
+    for i in range(3):
+        create(f"Printer repair {i}", suggested=22, chosen=30)
+    # Below the default threshold of 3: twice 15 -> 14.
+    for i in range(2):
+        create(f"Office move {i}", suggested=15, chosen=14)
+    create("Accepted as suggested", suggested=31, chosen=31)  # no correction
+
+    patterns = client.get("/organizations/me/commodity-corrections",
+                          headers=_auth(admin)).json()
+    assert [(p["suggested"]["id"], p["chosen"]["id"], p["count"]) for p in patterns] == [
+        (22, 30, 3)]
+    assert set(patterns[0]["examples"]) == {f"Printer repair {i}" for i in range(3)}
+
+    # The admin lowers the threshold; the second pattern appears.
+    client.patch("/organizations/me/settings", headers=_auth(admin),
+                 json={"correction_alert_threshold": 2})
+    patterns = client.get("/organizations/me/commodity-corrections",
+                          headers=_auth(admin)).json()
+    assert {(p["suggested"]["id"], p["chosen"]["id"]) for p in patterns} == {(22, 30), (15, 14)}
+    client.patch("/organizations/me/settings", headers=_auth(admin),
+                 json={"correction_alert_threshold": 3})
+
+    # Admins only.
+    assert client.get("/organizations/me/commodity-corrections",
+                      headers=_auth(requester)).status_code == 403

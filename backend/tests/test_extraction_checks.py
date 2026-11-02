@@ -225,7 +225,8 @@ def _fake_openai(*extraction_replies: dict):
         if response_format is Quote:
             reply = next(replies)
         else:
-            reply = {"commodity_group_name": "Hardware", "commodity_group_id": 29}
+            reply = {"line_rules": [], "commodity_group_name": "Hardware",
+                     "commodity_group_id": 29}
         message = SimpleNamespace(
             parsed=response_format.model_validate(reply),
             content=json.dumps(reply),

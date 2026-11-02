@@ -12,10 +12,14 @@ from app.models import (
     Organization,
     OrganizationInvite,
     OrganizationMember,
+    ProcurementRequest,
     Profile,
+    RequestActivity,
     User,
 )
 from app.schemas.organizations import (
+    CorrectionPattern,
+    GroupRef,
     InviteAccept,
     InviteCreate,
     InviteOut,
@@ -27,6 +31,7 @@ from app.schemas.organizations import (
     OrganizationOut,
     OrganizationSettings,
 )
+from app.services.commodity_groups import get_visible_group
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
@@ -95,9 +100,58 @@ def update_settings(
     db: Session = Depends(get_db),
 ) -> OrganizationSettings:
     org = db.get(Organization, membership.organization_id)
-    org.settings = payload.model_dump()
+    # Merge: only the settings sent are changed (saving required fields from
+    # the UI must not wipe the commodity rules, and vice versa).
+    changes = payload.model_dump(exclude_unset=True)
+    for rule in payload.commodity_rules if "commodity_rules" in changes else []:
+        if get_visible_group(db, rule.commodity_group_id, org.id) is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Unknown commodity group id: {rule.commodity_group_id}",
+            )
+    org.settings = {**(org.settings or {}), **changes}
     db.commit()
-    return payload
+    return OrganizationSettings(**org.settings)
+
+
+@router.get("/me/commodity-corrections", response_model=list[CorrectionPattern])
+def get_commodity_corrections(
+    membership: OrganizationMember = Depends(require_org_admin),
+    db: Session = Depends(get_db),
+) -> list[CorrectionPattern]:
+    """"AI suggested X, requester chose Y" pairs seen at least the configured number of times.
+
+    Read from the activity log (no extra table): each request records when its
+    requester replaced the suggested commodity group.
+    """
+    org = db.get(Organization, membership.organization_id)
+    threshold = OrganizationSettings(**(org.settings or {})).correction_alert_threshold
+    rows = db.execute(
+        select(RequestActivity.detail, ProcurementRequest.title)
+        .join(ProcurementRequest, ProcurementRequest.id == RequestActivity.request_id)
+        .where(
+            ProcurementRequest.organization_id == org.id,
+            RequestActivity.action == "commodity_group_corrected",
+        )
+        .order_by(RequestActivity.created_at.desc())
+    ).all()
+    pairs: dict[tuple[int, int], list[str]] = {}
+    for detail, title in rows:
+        key = ((detail or {}).get("suggested_id"), (detail or {}).get("chosen_id"))
+        pairs.setdefault(key, []).append(title)
+
+    patterns = []
+    for (suggested_id, chosen_id), titles in pairs.items():
+        suggested = get_visible_group(db, suggested_id, org.id) if suggested_id else None
+        chosen = get_visible_group(db, chosen_id, org.id) if chosen_id else None
+        if suggested and chosen and len(titles) >= threshold:
+            patterns.append(CorrectionPattern(
+                suggested=GroupRef.model_validate(suggested, from_attributes=True),
+                chosen=GroupRef.model_validate(chosen, from_attributes=True),
+                count=len(titles),
+                examples=titles[:3],
+            ))
+    return sorted(patterns, key=lambda p: -p.count)
 
 
 @router.get("/me/members", response_model=MembersResponse)

@@ -55,6 +55,12 @@ export default function NewRequestPage() {
   const [vatId, setVatId] = useState('');
   const [department, setDepartment] = useState('');
   const [commodityGroupId, setCommodityGroupId] = useState<number | null>(null);
+  // The group the AI suggested (to log it if the requester picks another one).
+  const [suggestedGroupId, setSuggestedGroupId] = useState<number | null>(null);
+  // Set when one of the organization's booking rules chose the group.
+  const [commodityRule, setCommodityRule] = useState<{ groupId: number; rule: string } | null>(
+    null
+  );
   const [orderLines, setOrderLines] = useState<OrderLine[]>([]);
   // Shipping, tax and fees outside the lines; total = lines + these (the full
   // amount Acme pays, which approval decisions depend on).
@@ -202,6 +208,12 @@ export default function NewRequestPage() {
       if (extracted.commodityGroupId) {
         setCommodityGroupId(extracted.commodityGroupId);
       }
+      setSuggestedGroupId(extracted.commodityGroupId ?? null);
+      setCommodityRule(
+        extracted.commodityRule && extracted.commodityGroupId
+          ? { groupId: extracted.commodityGroupId, rule: extracted.commodityRule }
+          : null
+      );
 
       // Missing fields: only those the request actually needs. Optional fields
       // (e.g. Department, rarely on a quote) are simply left empty.
@@ -324,6 +336,7 @@ export default function NewRequestPage() {
         orderLines: orderLines.map(({ positionDescription, unitPrice, amount, unit, totalPrice }) => ({
           positionDescription, unitPrice, amount, unit, totalPrice,
         })),
+        suggestedCommodityGroupId: suggestedGroupId,
         // Pass on what the requester was shown, so the approver sees it too.
         catalogAlternatives: orderLines.flatMap((line, lineIndex) =>
           line.suggestions?.length
@@ -509,6 +522,12 @@ export default function NewRequestPage() {
                 </option>
               ))}
             </select>
+            {commodityRule && commodityRule.groupId === commodityGroupId && (
+              <p className="mt-2 text-sm text-gray-600">
+                Set by your organization&apos;s booking rule for &ldquo;{commodityRule.rule}&rdquo;.
+                You can change it if this purchase is an exception.
+              </p>
+            )}
           </div>
         </div>
 

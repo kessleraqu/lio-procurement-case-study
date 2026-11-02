@@ -1,18 +1,21 @@
 import logging
+import uuid
+from dataclasses import dataclass
 
 from openai import OpenAI
 from pydantic import BaseModel, Field
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models import CommodityGroup
+from app.models import CommodityGroup, Organization
 from app.schemas.extraction import (
     ExtractedVendorData,
     ExtractionResponse,
     ExtractionWarning,
     OrderLineData,
 )
+from app.schemas.organizations import CommodityRule
+from app.services.commodity_groups import visible_groups
 from app.services.quote_checks import (
     Issue,
     additional_charges,
@@ -33,9 +36,30 @@ EXTRACTION_FAILED_MESSAGE = (
 _VARIANT_SEPARATOR = " — "
 
 
+class _LineRule(BaseModel):
+    line: int
+    rule: str | None = Field(description="The booking rule covering this line, copied exactly; else null")
+
+
 class _Classification(BaseModel):
+    # Asked first: which of the organization's booking rules covers each item line?
+    line_rules: list[_LineRule]
     commodity_group_name: str | None = Field(description="Name exactly as listed")
     commodity_group_id: int | None
+
+
+# A booking covering at least this share of a quote's item value, other than the
+# one the request is booked under, is worth telling the requester about.
+MIXED_BOOKING_SHARE = 0.2
+
+
+@dataclass(frozen=True)
+class _GroupChoice:
+    group: CommodityGroup | None
+    # Set when one of the organization's booking rules decided the group.
+    rule: CommodityRule | None = None
+    # (label, group name, value, share) per booking when the quote is mixed.
+    mixed: tuple[tuple[str, str, float, float], ...] = ()
 
 
 EXTRACTION_SYSTEM_PROMPT = (
@@ -80,20 +104,32 @@ Document Text:
 {pdf_text}"""
 
 
-def _build_classification_prompt(quote: Quote, groups_list: str) -> str:
+def _item_lines(quote: Quote) -> list[QuoteLine]:
+    return [line for line in quote.order_lines if line.line_type == "item"]
+
+
+def _build_classification_prompt(
+    quote: Quote, groups_list: str, rules: list[CommodityRule]
+) -> str:
     lines = "\n".join(
-        f"- {line.position_description}"
-        for line in quote.order_lines
-        if line.line_type == "item"
+        f"{i}: {line.position_description}" for i, line in enumerate(_item_lines(quote))
     )
     # The vendor's name is left out on purpose: the group depends on what is
     # bought, and names like "… Greenscapes" pull the model off course.
+    rule_section = ""
+    if rules:
+        rule_list = "\n".join(f'- "{rule.applies_to}"' for rule in rules)
+        rule_section = f"""
+This company has booking rules for specific kinds of purchases:
+{rule_list}
+For EACH item line above, say which rule covers it (also under other names, brands or model numbers, e.g. "zip ties" are cable ties) by copying the rule exactly, or null if none does.
+"""
     return f"""Classify this purchase into the SINGLE most appropriate commodity group, based on the PRIMARY nature and purpose of what is bought.
 
 Purchase: {quote.title or ""}
-Items:
+Item lines:
 {lines}
-
+{rule_section}
 Guidance:
 - Branded office decor/furniture -> Office Equipment (15)
 - Traditional promotional items (brochures, giveaways, banners) -> Promotional Materials (43)
@@ -105,9 +141,19 @@ Available Commodity Groups (ID | Category | Name):
 
 
 def _classify(
-    client: OpenAI, quote: Quote, groups: list[CommodityGroup]
-) -> CommodityGroup | None:
-    """Pick the commodity group in a second, small call. Failure is non-fatal."""
+    client: OpenAI,
+    quote: Quote,
+    groups: list[CommodityGroup],
+    rules: list[CommodityRule],
+) -> _GroupChoice:
+    """Pick one commodity group for the whole request. Failure is non-fatal.
+
+    The model picks a general group and says which booking rule (if any)
+    covers each item line. Code decides: the item value is summed per booking
+    (a rule's group, or the general group), and the largest share wins — a
+    rule only within its ``max_total`` (checked against the grand total). If
+    another booking also covers a large share, that's reported, not acted on.
+    """
     base_groups = [g for g in groups if _VARIANT_SEPARATOR not in g.name]
     groups_list = "\n".join(f"{g.id} | {g.category} | {g.name}" for g in base_groups)
     try:
@@ -115,33 +161,79 @@ def _classify(
             model=settings.openai_model,
             messages=[
                 {"role": "system", "content": CLASSIFICATION_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_classification_prompt(quote, groups_list)},
+                {
+                    "role": "user",
+                    "content": _build_classification_prompt(quote, groups_list, rules),
+                },
             ],
             response_format=_Classification,
-            max_completion_tokens=200,
+            max_completion_tokens=500,
             temperature=settings.openai_temperature,
             seed=settings.openai_seed,
         )
         choice = response.choices[0].message.parsed
     except Exception:  # noqa: BLE001 — the user can still pick the group by hand
         logger.exception("Error classifying commodity group")
-        return None
+        return _GroupChoice(None)
     if choice is None:
-        return None
+        return _GroupChoice(None)
 
     # Models copy names more reliably than numbers: trust the name, fall back to the id.
     by_name = {g.name.lower(): g for g in base_groups}
     by_id = {g.id: g for g in base_groups}
-    group = by_name.get((choice.commodity_group_name or "").strip().lower()) or by_id.get(
+    general = by_name.get((choice.commodity_group_name or "").strip().lower()) or by_id.get(
         choice.commodity_group_id
     )
-    if group is None and choice.commodity_group_id is not None:
+    if general is None and choice.commodity_group_id is not None:
         logger.warning(
             "Unknown commodity group returned: %s / %s",
             choice.commodity_group_id,
             choice.commodity_group_name,
         )
-    return group
+
+    # Which rule applies to each item line (unknown rules, missing groups and
+    # rules above their limit fall back to the general group).
+    groups_by_id = {g.id: g for g in groups}
+    rules_by_text = {r.applies_to.strip().lower(): r for r in rules}
+    total = quote.totals.grand_total
+    items = _item_lines(quote)
+    line_rule: dict[int, CommodityRule] = {}
+    for tag in choice.line_rules:
+        rule = rules_by_text.get((tag.rule or "").strip().lower())
+        if (
+            rule
+            and 0 <= tag.line < len(items)
+            and rule.commodity_group_id in groups_by_id
+            and (rule.max_total is None or (total is not None and total <= rule.max_total))
+        ):
+            line_rule[tag.line] = rule
+
+    # Value per booking; without prices, every line counts the same.
+    use_value = any((line.total_price or 0) > 0 for line in items)
+    buckets: dict[str | None, float] = {}
+    for i, line in enumerate(items):
+        key = line_rule[i].applies_to if i in line_rule else None
+        buckets[key] = buckets.get(key, 0) + ((line.total_price or 0) if use_value else 1)
+    if not buckets:
+        return _GroupChoice(general)
+
+    winner = max(buckets, key=lambda k: buckets[k])
+    rule = next((r for r in line_rule.values() if r.applies_to == winner), None)
+    group = groups_by_id[rule.commodity_group_id] if rule else general
+
+    grand = sum(buckets.values()) or 1
+    mixed: tuple = ()
+    if any(k != winner and v / grand >= MIXED_BOOKING_SHARE for k, v in buckets.items()):
+        def label(key):
+            if key is None:
+                return ("other items", general.name if general else "no group")
+            r = next(r for r in line_rule.values() if r.applies_to == key)
+            return (key, groups_by_id[r.commodity_group_id].name)
+        mixed = tuple(
+            (*label(k), v if use_value else 0.0, v / grand)
+            for k, v in sorted(buckets.items(), key=lambda kv: -kv[1])
+        )
+    return _GroupChoice(group, rule, mixed)
 
 
 def _to_line_data(line: QuoteLine) -> OrderLineData:
@@ -160,7 +252,8 @@ def _to_line_data(line: QuoteLine) -> OrderLineData:
     )
 
 
-def _to_api_data(quote: Quote, group: CommodityGroup | None) -> ExtractedVendorData:
+def _to_api_data(quote: Quote, choice: _GroupChoice) -> ExtractedVendorData:
+    group = choice.group
     return ExtractedVendorData(
         title=quote.title,
         vendor_name=quote.vendor_name,
@@ -180,6 +273,7 @@ def _to_api_data(quote: Quote, group: CommodityGroup | None) -> ExtractedVendorD
         ],
         commodity_group_id=group.id if group else None,
         commodity_group_name=group.name if group else None,
+        commodity_rule=choice.rule.applies_to if choice.rule else None,
     )
 
 
@@ -236,7 +330,27 @@ def _extract_with_checks(client: OpenAI, pdf_text: str) -> tuple[Quote | None, l
     return (retry, retry_issues) if len(retry_issues) <= len(issues) else (quote, issues)
 
 
-def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
+def _mixed_booking_warnings(choice: _GroupChoice) -> list[ExtractionWarning]:
+    """A notice (no action) when a quote's items would be booked differently."""
+    if not choice.mixed or choice.group is None:
+        return []
+    parts = "; ".join(
+        f"{label} → {group}" + (f" (${value:,.2f}, {share:.0%})" if value else f" ({share:.0%})")
+        for label, group, value, share in choice.mixed
+    )
+    return [ExtractionWarning(
+        code="mixed_booking",
+        message=(
+            f"This quote mixes items that are booked differently: {parts}. The request is "
+            f"booked under {choice.group.name} (the largest share); split it if "
+            "accounting needs separate bookings."
+        ),
+    )]
+
+
+def extract_vendor_data(
+    pdf_text: str, db: Session, organization_id: uuid.UUID | None = None
+) -> ExtractionResponse:
     """Extract vendor data from a quote, then classify its commodity group.
 
     Extraction sees only the document, so the quote isn't buried under the
@@ -256,9 +370,13 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
             error="OPENAI_API_KEY is not configured on the server",
         )
 
-    commodity_groups = list(
-        db.scalars(select(CommodityGroup).order_by(CommodityGroup.id))
-    )
+    # Shared groups plus the organization's own, and its booking rules.
+    commodity_groups = visible_groups(db, organization_id)
+    org = db.get(Organization, organization_id) if organization_id else None
+    rules = [
+        CommodityRule.model_validate(rule)
+        for rule in ((org.settings or {}).get("commodity_rules", []) if org else [])
+    ]
     if not commodity_groups:
         return ExtractionResponse(
             success=False,
@@ -274,7 +392,8 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
     if quote is None:
         return ExtractionResponse(success=False, error=EXTRACTION_FAILED_MESSAGE)
 
-    extracted = _to_api_data(quote, _classify(client, quote, commodity_groups))
+    choice = _classify(client, quote, commodity_groups, rules)
+    extracted = _to_api_data(quote, choice)
 
     # Report what the document didn't give us so the UI can ask for it.
     missing_fields: list[str] = []
@@ -301,5 +420,5 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
             ExtractionWarning(code=i.code, message=i.message)
             for i in issues
             if i.affects_request
-        ] or None,
+        ] + _mixed_booking_warnings(choice) or None,
     )

@@ -42,6 +42,8 @@ class ExtractedVendorData(BaseModel):
     alternatives: list[OrderLineData] = Field(default_factory=list)
     commodity_group_id: int | None = Field(default=None, alias="commodityGroupId")
     commodity_group_name: str | None = Field(default=None, alias="commodityGroupName")
+    # The organization's booking rule that set the group (e.g. "printer toner").
+    commodity_rule: str | None = Field(default=None, alias="commodityRule")
 
 
 class ExtractionWarning(BaseModel):

@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.deps import get_current_membership, require_buyer_or_admin
 from app.db.session import get_db
 from app.models import (
-    CommodityGroup,
     OrderLine,
     Organization,
     OrganizationMember,
@@ -25,6 +24,7 @@ from app.schemas.requests import (
     StatusUpdate,
 )
 from app.services.catalog_matching import snapshot_alternatives
+from app.services.commodity_groups import get_visible_group
 from app.services.uploads import read_pdf_upload
 
 router = APIRouter(prefix="/requests", tags=["requests"])
@@ -70,8 +70,11 @@ def _get_org_request(
     return request
 
 
-def _validate_commodity_group(db: Session, commodity_group_id: int) -> None:
-    if db.get(CommodityGroup, commodity_group_id) is None:
+def _validate_commodity_group(
+    db: Session, commodity_group_id: int, organization_id: uuid.UUID
+) -> None:
+    # Shared groups or the organization's own; another tenant's group is "unknown".
+    if get_visible_group(db, commodity_group_id, organization_id) is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Unknown commodity group id: {commodity_group_id}",
@@ -181,7 +184,7 @@ def create_request(
     membership: OrganizationMember = Depends(get_current_membership),
     db: Session = Depends(get_db),
 ) -> RequestOut:
-    _validate_commodity_group(db, payload.commodity_group_id)
+    _validate_commodity_group(db, payload.commodity_group_id, membership.organization_id)
     _enforce_required_fields(db, membership.organization_id, payload)
 
     # Vendor fields are already cleaned up during extraction, so we can persist
@@ -217,6 +220,19 @@ def create_request(
     db.add(request)
     db.flush()
     _log_activity(db, request.id, membership.user_id, "created", "Request created")
+    suggested_id = payload.suggested_commodity_group_id
+    if suggested_id is not None and suggested_id != payload.commodity_group_id:
+        suggested = get_visible_group(db, suggested_id, membership.organization_id)
+        chosen = get_visible_group(db, payload.commodity_group_id, membership.organization_id)
+        if suggested is not None and chosen is not None:
+            _log_activity(
+                db,
+                request.id,
+                membership.user_id,
+                "commodity_group_corrected",
+                f"Commodity group changed from the suggested {suggested.name} to {chosen.name}",
+                {"suggested_id": suggested.id, "chosen_id": chosen.id},
+            )
     if alternatives:
         count = len(alternatives)
         _log_activity(
@@ -242,7 +258,7 @@ def update_request(
     db: Session = Depends(get_db),
 ) -> RequestOut:
     request = _get_org_request(db, request_id, membership.organization_id)
-    _validate_commodity_group(db, payload.commodity_group_id)
+    _validate_commodity_group(db, payload.commodity_group_id, membership.organization_id)
     _enforce_required_fields(db, membership.organization_id, payload)
 
     changed = _changed_fields(request, payload)

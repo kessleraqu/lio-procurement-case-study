@@ -11,6 +11,18 @@ MemberRole = Literal["admin", "buyer", "requester"]
 ConfigurableRequiredField = Literal["vat_id", "department"]
 
 
+class CommodityRule(BaseModel):
+    """An organization's booking rule: purchases of X are always booked under group Y."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # What the rule covers, in plain words (e.g. "printer toner").
+    applies_to: str = Field(min_length=2, max_length=100)
+    commodity_group_id: int
+    # Only applies up to this request total (e.g. "small" subscriptions); None = always.
+    max_total: float | None = Field(default=None, gt=0)
+
+
 class OrganizationSettings(BaseModel):
     """Per-organization configuration. Stored as JSONB, validated here.
 
@@ -21,6 +33,26 @@ class OrganizationSettings(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     required_fields: list[ConfigurableRequiredField] = Field(default_factory=list)
+    # Booking rules that override the general commodity classification.
+    commodity_rules: list[CommodityRule] = Field(default_factory=list)
+    # Show admins an "AI suggested X, users chose Y" pattern once it happened
+    # this many times — a hint that a booking rule may be missing.
+    correction_alert_threshold: int = Field(default=3, ge=1, le=100)
+
+
+class GroupRef(BaseModel):
+    id: int
+    category: str
+    name: str
+
+
+class CorrectionPattern(BaseModel):
+    """Requesters repeatedly replaced the AI's commodity group with another one."""
+
+    suggested: GroupRef
+    chosen: GroupRef
+    count: int
+    examples: list[str]  # request titles, most recent first
 
 
 class OrganizationCreate(BaseModel):

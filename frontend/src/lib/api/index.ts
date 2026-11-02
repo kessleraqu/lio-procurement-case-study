@@ -45,8 +45,26 @@ export interface MyOrganization {
 // Request fields an org may optionally mark as required (see backend settings).
 export type ConfigurableRequiredField = 'vat_id' | 'department';
 
+// A booking rule: purchases of `applies_to` are booked under that group,
+// up to `max_total` (null = always).
+export interface CommodityRule {
+  applies_to: string;
+  commodity_group_id: number;
+  max_total: number | null;
+}
+
 export interface OrganizationSettings {
   required_fields: ConfigurableRequiredField[];
+  commodity_rules?: CommodityRule[];
+  // Show "AI suggested X, users chose Y" once it happened this many times.
+  correction_alert_threshold?: number;
+}
+
+export interface CorrectionPattern {
+  suggested: { id: number; category: string; name: string };
+  chosen: { id: number; category: string; name: string };
+  count: number;
+  examples: string[];
 }
 
 export interface MembersResponse {
@@ -73,6 +91,8 @@ export interface CreateRequestInput {
   orderLines: OrderLineInput[];
   // Catalog articles the form suggested per line, so the approver sees them.
   catalogAlternatives?: { lineIndex: number; articleIds: string[] }[];
+  // The AI's suggested group; a different choice is logged as a correction.
+  suggestedCommodityGroupId?: number | null;
 }
 
 export interface UpdateRequestInput {
@@ -106,6 +126,8 @@ export interface ExtractedVendorData {
   alternatives: ExtractedOrderLine[];
   commodityGroupId: number | null;
   commodityGroupName: string | null;
+  // The organization's booking rule that set the group (e.g. "printer toner").
+  commodityRule: string | null;
 }
 
 export interface ExtractionResponse {
@@ -273,6 +295,10 @@ export const organizations = {
     return apiFetch(`/organizations/me/invites/${inviteId}`, { method: 'DELETE' });
   },
 
+  getCommodityCorrections(): Promise<CorrectionPattern[]> {
+    return apiFetch('/organizations/me/commodity-corrections');
+  },
+
   acceptInvite(token: string): Promise<MyOrganization> {
     return apiFetch('/organizations/invites/accept', { body: { token } });
   },
@@ -281,7 +307,8 @@ export const organizations = {
     return apiFetch('/organizations/me/settings');
   },
 
-  updateSettings(settings: OrganizationSettings): Promise<OrganizationSettings> {
+  // Only the settings sent are changed (the backend merges).
+  updateSettings(settings: Partial<OrganizationSettings>): Promise<OrganizationSettings> {
     return apiFetch('/organizations/me/settings', { method: 'PATCH', body: settings });
   },
 };

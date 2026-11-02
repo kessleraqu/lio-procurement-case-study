@@ -9,7 +9,7 @@ with:
 import logging
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
@@ -163,6 +163,47 @@ def seed_organizations_and_accounts(db: Session) -> tuple[int, int]:
     return orgs_created, users_created
 
 
+# Acme's accounting quirks (case brief, complaint 3). "Office Supplies" is not in
+# the shared taxonomy, so it is created as an Acme-only group. Organization
+# groups get ids from 100000 up, clear of the shared taxonomy's fixed ids.
+ORG_GROUP_ID_START = 100_000
+ACME_GROUPS = [("Office & Administration", "Office Supplies")]
+ACME_RULES = [  # (applies_to, group name, max_total)
+    ("cable ties", "Electrical Engineering", None),
+    ("printer toner", "Hardware", None),
+    ("software subscriptions", "Office Supplies", 500.0),  # "small": to confirm with Acme
+]
+
+
+def seed_acme_accounting(db: Session, org: Organization) -> int:
+    """Create Acme's own commodity groups and booking rules if missing."""
+    db.flush()  # shared groups added earlier in this transaction must be queryable
+    created = 0
+    for category, name in ACME_GROUPS:
+        exists = db.scalar(select(CommodityGroup).where(
+            CommodityGroup.organization_id == org.id, CommodityGroup.name == name))
+        if exists is None:
+            next_id = max(db.scalar(select(func.max(CommodityGroup.id))) or 0,
+                          ORG_GROUP_ID_START - 1) + 1
+            db.add(CommodityGroup(id=next_id, category=category, name=name,
+                                  organization_id=org.id))
+            db.flush()
+            created += 1
+    if "commodity_rules" not in (org.settings or {}):
+        rules = []
+        for applies_to, group_name, max_total in ACME_RULES:
+            group = db.scalar(select(CommodityGroup).where(
+                CommodityGroup.name == group_name,
+                (CommodityGroup.organization_id == org.id)
+                | CommodityGroup.organization_id.is_(None),
+            ).order_by(CommodityGroup.id))
+            if group is not None:
+                rules.append({"applies_to": applies_to, "commodity_group_id": group.id,
+                              "max_total": max_total})
+        org.settings = {**(org.settings or {}), "commodity_rules": rules}
+    return created
+
+
 def seed(db: Session) -> dict[str, int]:
     """Seed everything. Returns counts of newly created rows per kind.
 
@@ -179,6 +220,8 @@ def seed(db: Session) -> dict[str, int]:
         "suppliers": seed_suppliers(db, dev_org_id) if dev_org_id else 0,
         # Articles reference suppliers by name, so this must run after suppliers.
         "articles": seed_articles(db, dev_org_id) if dev_org_id else 0,
+        # Needs the shared groups (seeded above) to resolve rule targets.
+        "acme_groups": seed_acme_accounting(db, dev_org) if dev_org else 0,
         "organizations": orgs_created,
         "users": users_created,
     }

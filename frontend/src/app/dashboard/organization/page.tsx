@@ -2,6 +2,7 @@
 
 import { useState, useEffect } from 'react';
 import * as api from '@/lib/api';
+import { BookingRules } from './BookingRules';
 import { Button, Input, Alert } from '@/components/base';
 import type { OrganizationMemberWithProfile, OrganizationInvite } from '@/types/database';
 
@@ -292,8 +293,10 @@ export default function OrganizationPage() {
               );
             })}
           </div>
+
         </div>
       )}
+      {tab === 'settings' && <BookingRules />}
     </div>
   );
 }
