@@ -24,10 +24,9 @@ from app.schemas.requests import (
     RequestUpdate,
     StatusUpdate,
 )
+from app.services.uploads import read_pdf_upload
 
 router = APIRouter(prefix="/requests", tags=["requests"])
-
-MAX_PDF_BYTES = 10 * 1024 * 1024
 
 # Human-readable labels for the fields we track in the activity log.
 _FIELD_LABELS = {
@@ -350,17 +349,7 @@ async def upload_document(
 ) -> None:
     """Attach (or replace) the original PDF for a request."""
     request = _get_org_request(db, request_id, membership.organization_id)
-
-    if file.content_type not in ("application/pdf", "application/x-pdf"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a PDF file"
-        )
-    content = await file.read()
-    if len(content) > MAX_PDF_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="PDF exceeds the 10MB limit",
-        )
+    content = await read_pdf_upload(file)
 
     document = db.scalar(
         select(RequestDocument).where(RequestDocument.request_id == request.id)

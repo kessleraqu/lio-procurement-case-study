@@ -397,8 +397,9 @@ def test_pdf_parse():
         files={"file": ("offer.pdf", buf.getvalue(), "application/pdf")},
         headers=_auth(token),
     )
-    assert r.status_code == 200, r.text
-    assert "text" in r.json()  # blank page -> empty text, but parses fine
+    # A blank page has no text layer -> treated like a scan, with a clear message.
+    assert r.status_code == 422, r.text
+    assert "scanned" in r.json()["detail"]
 
     # non-PDF rejected
     r = client.post(

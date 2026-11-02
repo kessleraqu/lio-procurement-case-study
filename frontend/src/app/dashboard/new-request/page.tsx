@@ -52,7 +52,11 @@ export default function NewRequestPage() {
     const uploadedFile = e.target.files?.[0];
     if (!uploadedFile) return;
 
-    if (uploadedFile.type !== 'application/pdf') {
+    // Browsers leave the MIME type empty for some files (e.g. "Quote.Pdf"), so
+    // also accept by extension; the backend verifies the actual file bytes.
+    const isPdf =
+      uploadedFile.type === 'application/pdf' || /\.pdf$/i.test(uploadedFile.name);
+    if (!isPdf) {
       setError('Please upload a PDF file');
       return;
     }
@@ -224,7 +228,7 @@ export default function NewRequestPage() {
           <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-accent-deep/50 transition-colors">
             <input
               type="file"
-              accept="application/pdf"
+              accept="application/pdf,.pdf"
               onChange={handleFileChange}
               className="hidden"
               id="pdf-upload"

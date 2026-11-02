@@ -84,13 +84,14 @@ export interface UpdateRequestInput {
   orderLines: OrderLineInput[];
 }
 
+// null = not found in the document (listed in ExtractionResponse.missingFields).
 export interface ExtractedVendorData {
-  title: string;
-  vendorName: string;
-  vatId: string;
-  department: string;
+  title: string | null;
+  vendorName: string | null;
+  vatId: string | null;
+  department: string | null;
   orderLines: OrderLineInput[];
-  totalCost: number;
+  totalCost: number | null;
   commodityGroupId: number | null;
   commodityGroupName: string | null;
 }
