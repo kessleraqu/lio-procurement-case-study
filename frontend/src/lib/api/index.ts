@@ -58,6 +58,8 @@ export interface OrganizationSettings {
   commodity_rules?: CommodityRule[];
   // Show "AI suggested X, users chose Y" once it happened this many times.
   correction_alert_threshold?: number;
+  // Requests whose full total is below this need no approval; null = all do.
+  auto_approve_below?: number | null;
 }
 
 export interface CorrectionPattern {

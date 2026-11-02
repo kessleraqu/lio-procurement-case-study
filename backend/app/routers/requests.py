@@ -15,6 +15,7 @@ from app.models import (
     RequestActivity,
     RequestDocument,
 )
+from app.schemas.organizations import OrganizationSettings
 from app.schemas.requests import (
     ApprovalDecision,
     RequestActivityOut,
@@ -92,6 +93,45 @@ def _enforce_required_fields(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Missing fields required by your organization: {', '.join(missing)}",
+        )
+
+
+def _auto_approve_below(db: Session, organization_id: uuid.UUID) -> float | None:
+    org = db.get(Organization, organization_id)
+    return OrganizationSettings(**(org.settings or {})).auto_approve_below if org else None
+
+
+def _apply_auto_approval(
+    db: Session, request: ProcurementRequest, actor_id: uuid.UUID, limit: float | None
+) -> None:
+    """Approve requests below the organization's limit without a buyer.
+
+    Compared against the full total (incl. tax and shipping). On edits, an
+    auto-approved request that reaches the limit goes back to pending, and a
+    pending one that drops below it is approved. Decisions a buyer made
+    (approved/rejected by someone) are left alone.
+    """
+    if limit is None:
+        return
+    total = float(request.total_cost or 0)
+    auto_approved = request.approval_status == "approved" and request.approved_by is None
+    if request.approval_status == "pending" and total < limit:
+        request.approval_status = "approved"
+        request.approved_at = datetime.now(timezone.utc)
+        _log_activity(
+            db, request.id, actor_id, "auto_approved",
+            f"Approved automatically: total ${total:,.2f} is below the "
+            f"${limit:,.0f} approval limit",
+            {"total": total, "limit": limit},
+        )
+    elif auto_approved and total >= limit:
+        request.approval_status = "pending"
+        request.approved_at = None
+        _log_activity(
+            db, request.id, actor_id, "approval_required",
+            f"Needs approval again: total ${total:,.2f} is no longer below the "
+            f"${limit:,.0f} approval limit",
+            {"total": total, "limit": limit},
         )
 
 
@@ -220,6 +260,9 @@ def create_request(
     db.add(request)
     db.flush()
     _log_activity(db, request.id, membership.user_id, "created", "Request created")
+    _apply_auto_approval(
+        db, request, membership.user_id, _auto_approve_below(db, membership.organization_id)
+    )
     suggested_id = payload.suggested_commodity_group_id
     if suggested_id is not None and suggested_id != payload.commodity_group_id:
         suggested = get_visible_group(db, suggested_id, membership.organization_id)
@@ -293,6 +336,10 @@ def update_request(
             "updated",
             f"Updated {', '.join(labels)}",
             {"changed_fields": changed},
+        )
+    if "total_cost" in changed:
+        _apply_auto_approval(
+            db, request, membership.user_id, _auto_approve_below(db, membership.organization_id)
         )
     db.commit()
 

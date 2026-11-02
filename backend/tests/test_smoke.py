@@ -420,9 +420,9 @@ def test_activity_log_and_document():
     payload = {
         "requestorName": "Alex Admin", "titleShortDescription": "Chairs",
         "vendorName": "FurnitureCo", "vatId": "12-0000001", "commodityGroupId": 15,
-        "totalCost": 500.0, "department": "Ops",
+        "totalCost": 5000.0, "department": "Ops",
         "orderLines": [
-            {"positionDescription": "Chair", "unitPrice": 250, "amount": 2, "unit": "pc", "totalPrice": 500}
+            {"positionDescription": "Chair", "unitPrice": 2500, "amount": 2, "unit": "pc", "totalPrice": 5000}
         ],
     }
     rid = client.post("/requests", json=payload, headers=_auth(admin)).json()["id"]
@@ -430,20 +430,20 @@ def test_activity_log_and_document():
     # edit two fields -> one 'updated' activity naming those fields
     updated = dict(payload)
     updated["title"] = "Office Chairs"
-    updated["totalCost"] = 600.0
+    updated["totalCost"] = 6000.0
     updated["orderLines"] = [
-        {"positionDescription": "Chair", "unitPrice": 300, "amount": 2, "unit": "pc", "totalPrice": 600}
+        {"positionDescription": "Chair", "unitPrice": 3000, "amount": 2, "unit": "pc", "totalPrice": 6000}
     ]
     # RequestUpdate uses "title" (not titleShortDescription)
     updated = {
         "requestorName": "Alex Admin", "title": "Office Chairs", "vendorName": "FurnitureCo",
-        "vatId": "12-0000001", "commodityGroupId": 15, "totalCost": 600.0, "department": "Ops",
+        "vatId": "12-0000001", "commodityGroupId": 15, "totalCost": 6000.0, "department": "Ops",
         "orderLines": updated["orderLines"],
     }
     r = client.put(f"/requests/{rid}", json=updated, headers=_auth(admin))
     assert r.status_code == 200, r.text
 
-    # approve, then a status change
+    # approve (above Acme's $2,000 auto-approval limit, so a buyer decides), then a status change
     client.patch(f"/requests/{rid}/approval", json={"decision": "approved"}, headers=_auth(admin))
     client.patch(f"/requests/{rid}/status", json={"status": "closed"}, headers=_auth(admin))
 
@@ -733,7 +733,7 @@ def test_org_settings_required_fields():
     r = client.get("/organizations/me/settings", headers=_auth(token))
     assert r.status_code == 200
     assert r.json() == {"required_fields": [], "commodity_rules": [],
-                        "correction_alert_threshold": 3}
+                        "correction_alert_threshold": 3, "auto_approve_below": None}
 
     base_payload = {
         "requestorName": "S", "titleShortDescription": "T", "vendorName": "V",
@@ -975,3 +975,48 @@ def test_admins_manage_their_own_commodity_groups():
     assert client.delete(f"/commodity-groups/{group['id']}",
                          headers=_auth(acme)).status_code == 204
     assert "Office Plants" not in names(acme)
+
+
+def test_requests_below_the_limit_need_no_approval():
+    acme = client.post("/auth/signin", json={"email": "admin@acme.com",
+                                             "password": "demo1234"}).json()["access_token"]
+    walmart = client.post("/auth/signin", json={"email": "admin@walmart.com",
+                                                "password": "demo1234"}).json()["access_token"]
+    assert client.get("/organizations/me/settings",
+                      headers=_auth(acme)).json()["auto_approve_below"] == 2000.0
+
+    def body(total, title="Desk lamps"):
+        return {
+            "requestorName": "A", "titleShortDescription": title, "title": title,
+            "vendorName": "V", "commodityGroupId": 15, "totalCost": total,
+            "orderLines": [{"positionDescription": title, "unitPrice": total, "amount": 1,
+                            "unit": "piece", "totalPrice": total}],
+        }
+
+    def actions(rid, token=acme):
+        return [a["action"] for a in
+                client.get(f"/requests/{rid}/activity", headers=_auth(token)).json()]
+
+    below = client.post("/requests", json=body(1686.14), headers=_auth(acme)).json()
+    assert below["approval_status"] == "approved" and below["approved_by"] is None
+    assert "auto_approved" in actions(below["id"])
+
+    at_limit = client.post("/requests", json=body(2000.0), headers=_auth(acme)).json()
+    assert at_limit["approval_status"] == "pending"  # "below" $2,000, not "up to"
+
+    # Edits: the auto-approval follows the total in both directions.
+    r = client.put(f"/requests/{below['id']}", json=body(2042.15), headers=_auth(acme)).json()
+    assert r["approval_status"] == "pending" and "approval_required" in actions(below["id"])
+    r = client.put(f"/requests/{at_limit['id']}", json=body(1500.0), headers=_auth(acme)).json()
+    assert r["approval_status"] == "approved"
+
+    # A buyer's own decision is never undone by an edit.
+    big = client.post("/requests", json=body(18402.5), headers=_auth(acme)).json()
+    client.patch(f"/requests/{big['id']}/approval", json={"decision": "approved"},
+                 headers=_auth(acme))
+    r = client.put(f"/requests/{big['id']}", json=body(500.0), headers=_auth(acme)).json()
+    assert r["approval_status"] == "approved" and r["approved_by"] is not None
+
+    # No limit configured -> every request needs approval (the old behaviour).
+    other = client.post("/requests", json=body(10.0), headers=_auth(walmart)).json()
+    assert other["approval_status"] == "pending"

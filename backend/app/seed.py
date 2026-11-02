@@ -175,7 +175,7 @@ ACME_RULES = [  # (applies_to, group name, max_total)
 
 
 def seed_acme_accounting(db: Session, org: Organization) -> int:
-    """Create Acme's own commodity groups and booking rules if missing."""
+    """Create Acme's own commodity groups, booking rules and approval limit if missing."""
     db.flush()  # shared groups added earlier in this transaction must be queryable
     created = 0
     for category, name in ACME_GROUPS:
@@ -186,6 +186,9 @@ def seed_acme_accounting(db: Session, org: Organization) -> int:
                                   organization_id=org.id))
             db.flush()
             created += 1
+    if "auto_approve_below" not in (org.settings or {}):
+        # Case brief, bonus: "Anything below $2,000 shouldn't need approval."
+        org.settings = {**(org.settings or {}), "auto_approve_below": 2000.0}
     if "commodity_rules" not in (org.settings or {}):
         rules = []
         for applies_to, group_name, max_total in ACME_RULES:
