@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import * as api from '@/lib/api';
 import { useCommodityGroups } from '@/lib/hooks/useCommodityGroups';
 import { Button, Input, Alert, Loader } from '@/components/base';
@@ -13,6 +13,31 @@ interface OrderLine {
   amount: number;
   unit: string;
   totalPrice: number;
+  // Discount (negative) / surcharge (positive) from the quote, kept on edits.
+  priceAdjustmentPercent?: number | null;
+}
+
+// Rounding slack when comparing money amounts.
+const CENTS_TOLERANCE = 0.05;
+
+// Totals warnings the form re-checks live (below), so the backend's one-off
+// message isn't shown on top.
+const TOTALS_CHECKED_LIVE = ['lines_vs_subtotal', 'lines_vs_grand_total'];
+
+// Fields the extraction may report missing that are optional unless the
+// organization requires them (backend label -> organization setting).
+const OPTIONAL_FIELDS: Record<string, api.ConfigurableRequiredField> = {
+  'Tax ID': 'vat_id',
+  Department: 'department',
+};
+
+function lineTotal(line: OrderLine): number {
+  const adjustment = line.priceAdjustmentPercent ?? 0;
+  return Math.round(line.unitPrice * line.amount * (1 + adjustment / 100) * 100) / 100;
+}
+
+function formatMoney(value: number): string {
+  return `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 export default function NewRequestPage() {
@@ -27,7 +52,36 @@ export default function NewRequestPage() {
   const [department, setDepartment] = useState('');
   const [commodityGroupId, setCommodityGroupId] = useState<number | null>(null);
   const [orderLines, setOrderLines] = useState<OrderLine[]>([]);
-  const [totalCost, setTotalCost] = useState<number>(0);
+  // Shipping, tax and fees outside the lines; total = lines + these (the full
+  // amount Acme pays, which approval decisions depend on).
+  const [additionalCharges, setAdditionalCharges] = useState<number>(0);
+  // The uploaded quote's grand total, to check the form against while editing.
+  const [quoteTotal, setQuoteTotal] = useState<number | null>(null);
+  // Options the vendor offered instead of ordered items (not in the quote's total).
+  const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
+
+  const { data: orgSettings } = useQuery({
+    queryKey: ['organization-settings'],
+    queryFn: () => api.organizations.getSettings(),
+  });
+
+  const totalCost =
+    Math.round(
+      (orderLines.reduce((sum, line) => sum + line.totalPrice, 0) + additionalCharges) * 100
+    ) / 100;
+
+  // Live check against the quote: if the form no longer adds up to the quote's
+  // total, say by how much and point at the line that explains the gap.
+  const totalsMismatch = useMemo(() => {
+    if (quoteTotal === null || Math.abs(totalCost - quoteTotal) <= CENTS_TOLERANCE) {
+      return null;
+    }
+    const difference = Math.round((totalCost - quoteTotal) * 100) / 100;
+    const suspects = orderLines
+      .map((line, index) => ({ line, index }))
+      .filter(({ line }) => Math.abs(line.totalPrice - difference) <= CENTS_TOLERANCE);
+    return { difference, suspectIndex: suspects.length === 1 ? suspects[0].index : null };
+  }, [orderLines, quoteTotal, totalCost]);
 
   // UI state
   const [file, setFile] = useState<File | null>(null);
@@ -65,13 +119,15 @@ export default function NewRequestPage() {
     setError('');
     setSuccess('');
     setWarning('');
+    setQuoteTotal(null);
+    setAlternatives([]);
     setExtracting(true);
 
     try {
       // Step 1: Parse PDF
       const pdfText = await parsePDFMutation.mutateAsync(uploadedFile);
 
-      // Step 2: Extract structured data AND classify commodity group in one AI call
+      // Step 2: Extract structured data and classify the commodity group
       const extractionResult = await api.extraction.extract(pdfText);
       
       if (!extractionResult.success || !extractionResult.data) {
@@ -86,22 +142,30 @@ export default function NewRequestPage() {
       setVatId(extracted.vatId || '');
       setDepartment(extracted.department || '');
       setOrderLines(extracted.orderLines || []);
-      setTotalCost(extracted.totalCost || 0);
-      
+      setAdditionalCharges(extracted.additionalCharges || 0);
+      setQuoteTotal(extracted.totalCost ?? null);
+      setAlternatives(extracted.alternatives || []);
+
       // Set commodity group (now included in extraction)
       if (extracted.commodityGroupId) {
         setCommodityGroupId(extracted.commodityGroupId);
       }
 
-      // Show warnings for missing fields and for numbers that don't add up
+      // Missing fields: only those the request actually needs. Optional fields
+      // (e.g. Department, rarely on a quote) are simply left empty.
+      const required = orgSettings?.required_fields ?? [];
+      const missing = (extractionResult.missingFields ?? []).filter((label) => {
+        const optional = OPTIONAL_FIELDS[label];
+        return !optional || required.includes(optional);
+      });
       const warnings: string[] = [];
-      if (extractionResult.missingFields && extractionResult.missingFields.length > 0) {
-        warnings.push(
-          `⚠️ Could not extract: ${extractionResult.missingFields.join(', ')}. Please fill in these fields manually.`
-        );
+      if (missing.length > 0) {
+        warnings.push(`⚠️ Not found on the quote: ${missing.join(', ')}. Please fill these in.`);
       }
       for (const issue of extractionResult.warnings ?? []) {
-        warnings.push(`⚠️ Please double-check: ${issue}`);
+        if (!TOTALS_CHECKED_LIVE.includes(issue.code)) {
+          warnings.push(`⚠️ Please double-check: ${issue.message}`);
+        }
       }
       setWarning(warnings.join('\n'));
 
@@ -135,24 +199,26 @@ export default function NewRequestPage() {
     const updated = [...orderLines];
     updated[index] = { ...updated[index], [field]: value };
     
-    // Auto-calculate total price
-    if (field === 'unitPrice' || field === 'amount') {
-      updated[index].totalPrice = updated[index].unitPrice * updated[index].amount;
+    // Auto-calculate total price (keeping the quote's discount/surcharge)
+    if (field === 'unitPrice' || field === 'amount' || field === 'priceAdjustmentPercent') {
+      updated[index].totalPrice = lineTotal(updated[index]);
     }
-    
+
     setOrderLines(updated);
-    
-    // Update total cost
-    const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
+  };
+
+  // Order an alternative the vendor offered. The quote's printed total (and its
+  // tax) no longer applies, so stop checking against it rather than raise a
+  // false "doesn't add up" warning.
+  const orderAlternative = (index: number) => {
+    setOrderLines([...orderLines, alternatives[index]]);
+    setAlternatives(alternatives.filter((_, i) => i !== index));
+    setQuoteTotal(null);
   };
 
   // Remove order line
   const removeOrderLine = (index: number) => {
-    const updated = orderLines.filter((_, i) => i !== index);
-    setOrderLines(updated);
-    const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
+    setOrderLines(orderLines.filter((_, i) => i !== index));
   };
 
   // Submit form
@@ -184,7 +250,9 @@ export default function NewRequestPage() {
         commodityGroupId: commodityGroupId,
         totalCost,
         department,
-        orderLines,
+        orderLines: orderLines.map(({ positionDescription, unitPrice, amount, unit, totalPrice }) => ({
+          positionDescription, unitPrice, amount, unit, totalPrice,
+        })),
       });
 
       // Attach the original PDF (if one was uploaded) so it shows on the detail page.
@@ -220,6 +288,12 @@ export default function NewRequestPage() {
 
       {error && <Alert variant="error" className="mb-6">{error}</Alert>}
       {warning && <Alert variant="warning" className="mb-6 whitespace-pre-line">{warning}</Alert>}
+      {totalsMismatch && (
+        <Alert variant="warning" className="mb-6">
+          ⚠️ The order lines don&apos;t add up to the quote&apos;s total — see the note under Total Cost
+          {totalsMismatch.suspectIndex !== null ? ' and the highlighted line' : ''}.
+        </Alert>
+      )}
       {success && <Alert variant="success" className="mb-6">{success}</Alert>}
 
       <form onSubmit={handleSubmit} className="space-y-8">
@@ -377,7 +451,14 @@ export default function NewRequestPage() {
           ) : (
             <div className="space-y-4">
               {orderLines.map((line, index) => (
-                <div key={index} className="border border-gray-200 rounded-lg p-4">
+                <div
+                  key={index}
+                  className={`border rounded-lg p-4 ${
+                    totalsMismatch?.suspectIndex === index
+                      ? 'border-amber-400 bg-amber-50'
+                      : 'border-gray-200'
+                  }`}
+                >
                   <div className="flex items-start justify-between mb-4">
                     <h3 className="text-sm font-medium text-gray-700">Line {index + 1}</h3>
                     <button
@@ -389,7 +470,7 @@ export default function NewRequestPage() {
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4">
                     <div className="lg:col-span-2">
                       <Input
                         label="Description"
@@ -431,28 +512,109 @@ export default function NewRequestPage() {
                       required
                       placeholder="pcs, licenses, etc."
                     />
+
+                    {/* Shown as a positive discount; stored signed (−20 = 20% off). */}
+                    <Input
+                      label="Discount %"
+                      type="number"
+                      step="0.01"
+                      value={line.priceAdjustmentPercent ? -line.priceAdjustmentPercent : ''}
+                      onChange={(e) => {
+                        const discount = parseFloat(e.target.value);
+                        updateOrderLine(
+                          index,
+                          'priceAdjustmentPercent',
+                          Number.isNaN(discount) || discount === 0 ? 0 : -discount
+                        );
+                      }}
+                      placeholder="0"
+                    />
                   </div>
 
-                  <div className="mt-2 text-right">
-                    <span className="text-sm text-gray-600">Total: </span>
-                    <span className="text-lg font-semibold tracking-tight text-ink">
-                      ${line.totalPrice.toFixed(2)}
+                  <div className="mt-2 flex items-center justify-between gap-4">
+                    <span className="text-sm text-amber-800">
+                      {totalsMismatch?.suspectIndex === index &&
+                        "Not part of the quote's total — probably an alternative or optional item."}
+                    </span>
+                    <span>
+                      <span className="text-sm text-gray-600">Total: </span>
+                      <span className="text-lg font-semibold tracking-tight text-ink">
+                        {formatMoney(line.totalPrice)}
+                      </span>
                     </span>
                   </div>
                 </div>
               ))}
             </div>
           )}
+
+          {alternatives.length > 0 && (
+            <div className="mt-4 border border-dashed border-gray-300 rounded-lg p-4">
+              <h3 className="text-sm font-medium text-gray-700">
+                Alternatives offered on this quote
+              </h3>
+              <p className="text-xs text-gray-500 mb-3">
+                Not included in the quote&apos;s total. Use one to add it to the order, then
+                remove the line it replaces and check shipping, tax &amp; fees.
+              </p>
+              <ul className="space-y-2">
+                {alternatives.map((alternative, index) => (
+                  <li key={index} className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-gray-800">{alternative.positionDescription}</span>
+                    <span className="flex items-center gap-3 shrink-0">
+                      <span className="text-sm font-medium text-ink">
+                        {formatMoney(alternative.totalPrice)}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => orderAlternative(index)}
+                      >
+                        Use this
+                      </Button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+            <p className="text-sm text-gray-600">
+              Shipping, tax and fees charged on the quote outside the line items.
+            </p>
+            <Input
+              label="Shipping, tax & fees ($)"
+              type="number"
+              step="0.01"
+              value={additionalCharges}
+              onChange={(e) => setAdditionalCharges(parseFloat(e.target.value) || 0)}
+            />
+          </div>
         </div>
 
         {/* Total Cost */}
-        <div className="bg-accent-soft/20 border-2 border-accent/40 rounded-lg p-6">
+        <div className="bg-accent-soft/20 border-2 border-accent/40 rounded-lg p-6 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-lg font-medium text-gray-900">Total Cost</span>
             <span className="text-3xl font-bold text-accent-deep">
-              ${totalCost.toFixed(2)}
+              {formatMoney(totalCost)}
             </span>
           </div>
+          {totalsMismatch && quoteTotal !== null && (
+            <Alert variant="warning">
+              {totalsMismatch.suspectIndex !== null
+                ? `Line ${totalsMismatch.suspectIndex + 1} ("${
+                    orderLines[totalsMismatch.suspectIndex].positionDescription
+                  }", ${formatMoney(totalsMismatch.difference)}) isn't included in the quote's total of ${formatMoney(
+                    quoteTotal
+                  )}. It's probably an alternative or optional item — remove it if you're not ordering it.`
+                : `This adds up to ${formatMoney(totalCost)}, but the quote's total is ${formatMoney(
+                    quoteTotal
+                  )} (difference ${formatMoney(totalsMismatch.difference)}). Please check the lines against the quote.`}
+            </Alert>
+          )}
         </div>
 
         {/* Submit */}

@@ -7,9 +7,19 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models import CommodityGroup
-from app.schemas.extraction import ExtractedVendorData, ExtractionResponse, OrderLineData
-from app.services.quote_checks import Issue, find_issues, normalize_tax_id
-from app.services.quote_model import Quote
+from app.schemas.extraction import (
+    ExtractedVendorData,
+    ExtractionResponse,
+    ExtractionWarning,
+    OrderLineData,
+)
+from app.services.quote_checks import (
+    Issue,
+    additional_charges,
+    find_issues,
+    normalize_tax_id,
+)
+from app.services.quote_model import Quote, QuoteLine
 
 logger = logging.getLogger(__name__)
 
@@ -133,24 +143,40 @@ def _classify(
     return group
 
 
+def _to_line_data(line: QuoteLine) -> OrderLineData:
+    total = line.total_price
+    if total is None and line.unit_price is not None:
+        # Alternatives are often priced per unit only ("U.P."), without a total.
+        adjustment = line.price_adjustment_percent or 0
+        total = round((line.amount or 1) * line.unit_price * (1 + adjustment / 100), 2)
+    return OrderLineData(
+        position_description=line.position_description,
+        unit_price=line.unit_price or 0,
+        amount=line.amount or 0,
+        unit=line.unit or "",
+        total_price=total or 0,
+        price_adjustment_percent=line.price_adjustment_percent,
+    )
+
+
 def _to_api_data(quote: Quote, group: CommodityGroup | None) -> ExtractedVendorData:
     return ExtractedVendorData(
         title=quote.title,
         vendor_name=quote.vendor_name,
         vat_id=normalize_tax_id(quote.vat_id),
         department=quote.department,
-        order_lines=[
-            OrderLineData(
-                position_description=line.position_description,
-                unit_price=line.unit_price or 0,
-                amount=line.amount or 0,
-                unit=line.unit or "",
-                total_price=line.total_price or 0,
-            )
-            # Alternatives, section headers and tax rows aren't part of the order.
-            for line in quote.ordered_lines
-        ],
+        # Alternatives, section headers and tax rows aren't part of the order.
+        order_lines=[_to_line_data(line) for line in quote.ordered_lines],
         total_cost=quote.totals.grand_total,
+        additional_charges=additional_charges(quote),
+        # Priced alternatives are offered to the requester instead of dropped
+        # (an "Alternative: …" heading without a price is not an option).
+        alternatives=[
+            _to_line_data(line)
+            for line in quote.order_lines
+            if line.line_type == "alternative"
+            and (line.unit_price is not None or line.total_price is not None)
+        ],
         commodity_group_id=group.id if group else None,
         commodity_group_name=group.name if group else None,
     )
@@ -269,5 +295,9 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
         success=True,
         data=extracted,
         missing_fields=missing_fields or None,
-        warnings=[i.message for i in issues if i.affects_request] or None,
+        warnings=[
+            ExtractionWarning(code=i.code, message=i.message)
+            for i in issues
+            if i.affects_request
+        ] or None,
     )

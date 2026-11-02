@@ -84,14 +84,24 @@ export interface UpdateRequestInput {
   orderLines: OrderLineInput[];
 }
 
+export interface ExtractedOrderLine extends OrderLineInput {
+  // Discount (negative) or surcharge (positive) printed on the line, in percent.
+  priceAdjustmentPercent: number | null;
+}
+
 // null = not found in the document (listed in ExtractionResponse.missingFields).
 export interface ExtractedVendorData {
   title: string | null;
   vendorName: string | null;
   vatId: string | null;
   department: string | null;
-  orderLines: OrderLineInput[];
+  orderLines: ExtractedOrderLine[];
+  // The quote's grand total, as printed.
   totalCost: number | null;
+  // Shipping, fees and tax outside the order lines: lines + this = totalCost.
+  additionalCharges: number;
+  // Options the vendor offers instead of ordered lines; not part of totalCost.
+  alternatives: ExtractedOrderLine[];
   commodityGroupId: number | null;
   commodityGroupName: string | null;
 }
@@ -102,7 +112,13 @@ export interface ExtractionResponse {
   error?: string;
   missingFields?: string[];
   // Inconsistencies the extraction couldn't resolve (e.g. totals don't add up).
-  warnings?: string[] | null;
+  warnings?: ExtractionWarning[] | null;
+}
+
+export interface ExtractionWarning {
+  // e.g. 'lines_vs_subtotal', 'line_math', 'vendor_is_customer'
+  code: string;
+  message: string;
 }
 
 export interface Supplier {

@@ -15,7 +15,7 @@ from sqlalchemy.pool import StaticPool
 from app.db.base import Base
 from app.seed import seed_commodity_groups
 from app.services.extraction import extract_vendor_data
-from app.services.quote_checks import find_issues, normalize_tax_id
+from app.services.quote_checks import additional_charges, find_issues, normalize_tax_id
 from app.services.quote_model import Quote
 
 
@@ -165,6 +165,40 @@ def test_normalize_tax_id(raw, expected):
     assert normalize_tax_id(raw) == expected
 
 
+# --- additional_charges -----------------------------------------------------
+
+def _charges(subtotal=None, **kwargs) -> float:
+    quote = _quote(**kwargs)
+    quote["totals"]["items_subtotal"] = subtotal
+    return additional_charges(Quote.model_validate(quote))
+
+
+def test_charges_are_everything_between_subtotal_and_grand_total():
+    assert _charges(subtotal=20.0, shipping=10.0, tax=2.5, grand_total=32.5) == 12.5
+
+
+def test_shipping_line_outside_the_subtotal_is_not_counted_twice():
+    lines = [_line(), _line("shipping", "Freight", 1, 10.0, 10.0)]
+    # Subtotal covers items only; the freight line is already in the lines.
+    assert _charges(subtotal=20.0, order_lines=lines, tax=2.5, grand_total=32.5) == 2.5
+
+
+def test_shipping_line_inside_the_subtotal_is_not_counted_twice():
+    lines = [_line(), _line("shipping", "Freight", 1, 10.0, 10.0)]
+    assert _charges(subtotal=30.0, order_lines=lines, tax=2.5, grand_total=32.5) == 2.5
+
+
+def test_without_a_subtotal_charges_come_from_the_totals_block():
+    assert _charges(shipping=10.0, fees=1.0, tax=2.5, grand_total=33.5) == 13.5
+
+
+def test_misread_lines_do_not_change_the_charges():
+    # An alternative counted as ordered must stay visible as a gap, not be absorbed.
+    lines = [_line(), _line(description="Optional upgrade", amount=1, unit_price=50.0,
+                            total_price=50.0)]
+    assert _charges(subtotal=20.0, order_lines=lines, tax=2.0, grand_total=22.0) == 2.0
+
+
 # --- extraction retry flow ---------------------------------------------------
 
 @pytest.fixture
@@ -243,4 +277,25 @@ def test_issues_that_survive_the_retry_are_returned_as_warnings(db):
         result = extract_vendor_data("quote text", db)
 
     assert result.success
-    assert result.warnings and "grand total" in result.warnings[0]
+    assert result.warnings and result.warnings[0].code == "lines_vs_grand_total"
+    assert "grand total" in result.warnings[0].message
+
+
+def test_priced_alternatives_are_offered_separately_and_not_ordered(db):
+    reply = _quote(
+        order_lines=[
+            _line(),
+            _line("alternative", "Alternative: premium option", None, None, None),  # heading
+            _line("alternative", "Premium widget", 2, 30.0, None),  # priced per unit only
+        ],
+        grand_total=20.0,
+    )
+    fake, _ = _fake_openai(reply)
+
+    with patch("app.services.extraction.OpenAI", fake):
+        result = extract_vendor_data("quote text", db)
+
+    assert [line.position_description for line in result.data.order_lines] == ["Widget"]
+    assert [(a.position_description, a.total_price) for a in result.data.alternatives] == [
+        ("Premium widget", 60.0)
+    ]

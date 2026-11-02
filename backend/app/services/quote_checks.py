@@ -33,6 +33,8 @@ def _money(value: float) -> str:
 
 @dataclass(frozen=True)
 class Issue:
+    # Stable identifier, so clients can treat kinds of issue differently.
+    code: str
     message: str
     # False for slips that only affect fields the request doesn't use (e.g. the
     # tax breakdown when the grand total itself was read correctly): worth a
@@ -57,13 +59,14 @@ def find_issues(quote: Quote) -> list[Issue]:
     vendor, customer = _company_key(quote.vendor_name), _company_key(quote.customer_name)
     if vendor and customer and (vendor in customer or customer in vendor):
         issues.append(Issue(
+            "vendor_is_customer",
             f"The vendor ({quote.vendor_name!r}) is the same company as the customer "
             "the quote is addressed to; the vendor is the company that issued the quote."
         ))
 
     ordered = quote.ordered_lines
     if not ordered:
-        issues.append(Issue("No ordered line items were found."))
+        issues.append(Issue("no_lines", "No ordered line items were found."))
 
     for line in ordered:
         if line.line_type == "discount" or None in (
@@ -77,6 +80,7 @@ def find_issues(quote: Quote) -> list[Issue]:
         if not _close(expected, line.total_price):
             adjustment_note = f" {adjustment:+g}%" if adjustment else ""
             issues.append(Issue(
+                "line_math",
                 f"Line {line.position_description[:60]!r}: {line.amount:g} × "
                 f"{_money(line.unit_price)}{adjustment_note} = {_money(expected)}, "
                 f"but its total is {_money(line.total_price)}."
@@ -84,7 +88,7 @@ def find_issues(quote: Quote) -> list[Issue]:
 
     totals = quote.totals
     if totals.grand_total is None:
-        issues.append(Issue("No grand total was found."))
+        issues.append(Issue("no_grand_total", "No grand total was found."))
     if not ordered:
         return issues
 
@@ -100,6 +104,7 @@ def find_issues(quote: Quote) -> list[Issue]:
         # The printed subtotal may or may not include shipping/fee lines.
         if not (_close(items_sum, subtotal) or _close(lines_sum, subtotal)):
             issues.append(Issue(
+                "lines_vs_subtotal",
                 f"The ordered lines add up to {_money(lines_sum)}, but the quote's items "
                 f"subtotal is {_money(subtotal)} (difference {_money(lines_sum - subtotal)}). "
                 "Check for alternative or optional items counted as ordered, missing "
@@ -122,6 +127,7 @@ def find_issues(quote: Quote) -> list[Issue]:
             gap = totals.grand_total - max(candidates)
             source = "items subtotal" if subtotal is not None else "ordered lines"
             issues.append(Issue(
+                "totals_block" if subtotal is not None else "lines_vs_grand_total",
                 f"The {source} ({_money(base)}) plus shipping ({_money(totals.shipping or 0)}), "
                 f"fees ({_money(totals.fees or 0)}) and tax ({_money(tax)}) does not add up to "
                 f"the grand total {_money(totals.grand_total)} (difference {_money(gap)}). "
@@ -132,3 +138,34 @@ def find_issues(quote: Quote) -> list[Issue]:
             ))
 
     return issues
+
+
+def additional_charges(quote: Quote) -> float:
+    """Shipping, fees and tax charged outside the order lines (lines + this = grand total).
+
+    Taken from the quote's own totals block, not from the lines, so that if the
+    lines are misread (e.g. an alternative counted) the gap stays visible
+    instead of being absorbed here.
+    """
+    totals = quote.totals
+    if totals.grand_total is None:
+        return 0.0
+    ordered = quote.ordered_lines
+    items_sum = sum(line.total_price or 0 for line in ordered
+                    if line.line_type in ("item", "discount"))
+    charge_lines = sum(line.total_price or 0 for line in ordered
+                       if line.line_type in ("shipping", "fee"))
+    if totals.items_subtotal is not None:
+        # A printed subtotal either includes shipping/fee lines or it doesn't.
+        includes_charge_lines = charge_lines and _close(items_sum + charge_lines,
+                                                        totals.items_subtotal)
+        outside = totals.grand_total - totals.items_subtotal
+        return round(outside - (0 if includes_charge_lines else charge_lines), 2)
+    has_shipping_line = any(line.line_type == "shipping" for line in ordered)
+    has_fee_line = any(line.line_type == "fee" for line in ordered)
+    return round(
+        (totals.tax or 0)
+        + (0 if has_shipping_line else totals.shipping or 0)
+        + (0 if has_fee_line else totals.fees or 0),
+        2,
+    )
