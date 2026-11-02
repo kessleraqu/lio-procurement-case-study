@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import * as api from '@/lib/api';
@@ -17,8 +17,18 @@ interface OrderLine {
   priceAdjustmentPercent?: number | null;
   // Negotiated catalog articles for this line (shown, never applied automatically).
   suggestions?: api.ArticleSuggestion[];
-  // The catalog was checked for this line's current description.
+  // The catalog was checked for this line's current matching inputs.
   catalogChecked?: boolean;
+}
+
+type CatalogVendor = { vendorName?: string; vendorTaxId?: string };
+
+function catalogCheckKey(line: OrderLine, vendor: CatalogVendor): string {
+  // Quantity and discount don't affect the matcher's current results.
+  return JSON.stringify([
+    line.positionDescription, line.unit, line.unitPrice,
+    vendor.vendorName ?? '', vendor.vendorTaxId ?? '',
+  ]);
 }
 
 // Rounding slack when comparing money amounts.
@@ -72,19 +82,33 @@ export default function NewRequestPage() {
 
   const [checkingCatalog, setCheckingCatalog] = useState(false);
   const [catalogCheckFailed, setCatalogCheckFailed] = useState(false);
+  const catalogRequestId = useRef(0);
+
+  const invalidateCatalog = () => {
+    // A vendor change or new upload also makes any in-flight lookup obsolete.
+    catalogRequestId.current += 1;
+    setCheckingCatalog(false);
+    setCatalogCheckFailed(false);
+    setOrderLines((current) => current.map((line) => ({
+      ...line, suggestions: undefined, catalogChecked: false,
+    })));
+  };
 
   // Look up negotiated catalog prices for the given lines. Every line must be
   // checked before the request can be created; if the check itself fails, the
   // lines count as checked so the request is never blocked by an outage.
   const checkCatalog = async (
     lines: OrderLine[],
-    vendor: { vendorName?: string; vendorTaxId?: string }
+    vendor: CatalogVendor
   ) => {
     const withText = lines.filter((line) => line.positionDescription.trim());
     if (withText.length === 0) return;
+    const requestId = ++catalogRequestId.current;
+    const keys = withText.map((line) => catalogCheckKey(line, vendor));
     setCheckingCatalog(true);
     setCatalogCheckFailed(false);
     let results: api.ArticleSuggestion[][] = withText.map(() => []);
+    let failed = false;
     try {
       const { suggestions } = await api.articles.suggest(
         withText.map(({ positionDescription, unitPrice, amount, unit }) => ({
@@ -95,18 +119,23 @@ export default function NewRequestPage() {
       results = withText.map((_, i) => suggestions[i] ?? []);
     } catch (err) {
       console.error('Catalog check failed:', err);
-      setCatalogCheckFailed(true);
+      failed = true;
     } finally {
-      // Lines edited meanwhile are new objects, so they stay unchecked.
-      const byLine = new Map(withText.map((line, i) => [line, results[i]]));
-      setOrderLines((current) =>
-        current.map((line) =>
-          byLine.has(line)
-            ? { ...line, suggestions: byLine.get(line), catalogChecked: true }
-            : line
-        )
-      );
-      setCheckingCatalog(false);
+      if (requestId === catalogRequestId.current) {
+        // Ignore responses for superseded vendors/uploads/lookups. For the
+        // current lookup, only apply results whose matching inputs still agree.
+        const byKey = new Map(keys.map((key, i) => [key, results[i]]));
+        setOrderLines((current) =>
+          current.map((line) => {
+            const key = catalogCheckKey(line, vendor);
+            return byKey.has(key)
+              ? { ...line, suggestions: byKey.get(key), catalogChecked: true }
+              : line;
+          })
+        );
+        setCatalogCheckFailed(failed);
+        setCheckingCatalog(false);
+      }
     }
   };
 
@@ -115,7 +144,7 @@ export default function NewRequestPage() {
     queryFn: () => api.organizations.getSettings(),
   });
 
-  // Lines whose description hasn't been checked against the catalog yet.
+  // Lines whose current matching inputs haven't been checked against the catalog yet.
   const uncheckedLines = orderLines.filter(
     (line) => line.positionDescription.trim() && !line.catalogChecked
   );
@@ -174,6 +203,7 @@ export default function NewRequestPage() {
     }
 
     setFile(uploadedFile);
+    invalidateCatalog();
     setError('');
     setSuccess('');
     setWarning('');
@@ -266,8 +296,8 @@ export default function NewRequestPage() {
   const updateOrderLine = (index: number, field: keyof OrderLine, value: string | number) => {
     const updated = [...orderLines];
     updated[index] = { ...updated[index], [field]: value };
-    if (field === 'positionDescription') {
-      // A new description is a new item: check the catalog again.
+    if (field === 'positionDescription' || field === 'unit' || field === 'unitPrice') {
+      // These inputs affect product matching, unit comparison and price filters.
       updated[index].suggestions = undefined;
       updated[index].catalogChecked = false;
     }
@@ -490,7 +520,10 @@ export default function NewRequestPage() {
             <Input
               label="Vendor Name *"
               value={vendorName}
-              onChange={(e) => setVendorName(e.target.value)}
+              onChange={(e) => {
+                setVendorName(e.target.value);
+                invalidateCatalog();
+              }}
               required
               placeholder="Adobe Systems"
             />
@@ -498,7 +531,10 @@ export default function NewRequestPage() {
             <Input
               label="Tax ID"
               value={vatId}
-              onChange={(e) => setVatId(e.target.value)}
+              onChange={(e) => {
+                setVatId(e.target.value);
+                invalidateCatalog();
+              }}
               placeholder="12-3456789"
             />
           </div>
