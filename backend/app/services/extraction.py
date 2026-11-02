@@ -119,7 +119,8 @@ def _classify(
             ],
             response_format=_Classification,
             max_completion_tokens=200,
-            temperature=0.3,
+            temperature=settings.openai_temperature,
+            seed=settings.openai_seed,
         )
         choice = response.choices[0].message.parsed
     except Exception:  # noqa: BLE001 — the user can still pick the group by hand
@@ -189,7 +190,8 @@ def _read_quote(client: OpenAI, messages: list[dict]) -> tuple[Quote | None, str
         messages=messages,
         response_format=Quote,
         max_completion_tokens=4000,
-        temperature=0.3,
+        temperature=settings.openai_temperature,
+        seed=settings.openai_seed,
     )
     message = response.choices[0].message
     if message.parsed is None:

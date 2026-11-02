@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     # gpt-4o-mini keeps extraction snappy — latency matters on the upload flow,
     # and larger models were noticeably slower without a real quality gain.
     openai_model: str = "gpt-4o-mini"
+    # Extraction, classification and catalog matching each have one right
+    # answer, so sample greedily and with a fixed seed: the same document gives
+    # (as far as OpenAI allows) the same result, and the scorecard stays comparable.
+    openai_temperature: float = 0.0
+    openai_seed: int = 7
 
     # CORS — NoDecode lets us accept a plain comma-separated string instead of
     # the JSON list pydantic-settings would otherwise demand from env vars.

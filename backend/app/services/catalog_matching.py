@@ -151,7 +151,8 @@ def suggest_articles(
             messages=[{"role": "user", "content": _build_prompt(lines, products)}],
             response_format=_Matches,
             max_completion_tokens=1000,
-            temperature=0.3,
+            temperature=settings.openai_temperature,
+            seed=settings.openai_seed,
         )
         matches = response.choices[0].message.parsed
     except Exception:  # noqa: BLE001 — suggestions are optional; never block the request
