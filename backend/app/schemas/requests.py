@@ -20,6 +20,13 @@ class OrderLineIn(BaseModel):
     total_price: float = Field(alias="totalPrice")
 
 
+class CatalogAlternativesIn(BaseModel):
+    """Catalog articles the form suggested for one order line (by position)."""
+
+    line_index: int = Field(alias="lineIndex", ge=0)
+    article_ids: list[uuid.UUID] = Field(alias="articleIds", max_length=10)
+
+
 class RequestCreate(BaseModel):
     requestor_name: str = Field(alias="requestorName")
     title: str = Field(alias="titleShortDescription")
@@ -29,6 +36,14 @@ class RequestCreate(BaseModel):
     total_cost: float = Field(alias="totalCost")
     department: str | None = None
     order_lines: list[OrderLineIn] = Field(alias="orderLines", min_length=1)
+    catalog_alternatives: list[CatalogAlternativesIn] | None = Field(
+        default=None, alias="catalogAlternatives"
+    )
+    # The group the AI suggested, if any — a different choice is logged as a
+    # correction so admins can spot missing booking rules.
+    suggested_commodity_group_id: int | None = Field(
+        default=None, alias="suggestedCommodityGroupId"
+    )
 
 
 class RequestUpdate(BaseModel):
@@ -60,6 +75,13 @@ class CommodityGroupOut(BaseModel):
     id: int
     category: str
     name: str
+    # Set for a group only this organization uses; None = shared taxonomy.
+    organization_id: uuid.UUID | None = None
+
+
+class CommodityGroupIn(BaseModel):
+    category: str = Field(min_length=2, max_length=100)
+    name: str = Field(min_length=2, max_length=100)
 
 
 class OrderLineOut(BaseModel):
@@ -106,6 +128,9 @@ class RequestOut(BaseModel):
     approved_by: uuid.UUID | None
     approved_at: datetime | None
     total_cost: float | None
+    # [{line_description, quoted_unit_price, unit, options: [{supplier_name,
+    #   article_number, description, unit_price, unit}]}] — see snapshot_alternatives
+    catalog_alternatives: list[dict] | None = None
     created_at: datetime
     updated_at: datetime
     order_lines: list[OrderLineOut]

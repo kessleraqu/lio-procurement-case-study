@@ -1,8 +1,8 @@
 'use client';
 
-import { useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import * as api from '@/lib/api';
 import { useCommodityGroups } from '@/lib/hooks/useCommodityGroups';
 import { Button, Input, Alert, Loader } from '@/components/base';
@@ -13,6 +13,45 @@ interface OrderLine {
   amount: number;
   unit: string;
   totalPrice: number;
+  // Discount (negative) / surcharge (positive) from the quote, kept on edits.
+  priceAdjustmentPercent?: number | null;
+  // Negotiated catalog articles for this line (shown, never applied automatically).
+  suggestions?: api.ArticleSuggestion[];
+  // The catalog was checked for this line's current matching inputs.
+  catalogChecked?: boolean;
+}
+
+type CatalogVendor = { vendorName?: string; vendorTaxId?: string };
+
+function catalogCheckKey(line: OrderLine, vendor: CatalogVendor): string {
+  // Quantity and discount don't affect the matcher's current results.
+  return JSON.stringify([
+    line.positionDescription, line.unit, line.unitPrice,
+    vendor.vendorName ?? '', vendor.vendorTaxId ?? '',
+  ]);
+}
+
+// Rounding slack when comparing money amounts.
+const CENTS_TOLERANCE = 0.05;
+
+// Totals warnings the form re-checks live (below), so the backend's one-off
+// message isn't shown on top.
+const TOTALS_CHECKED_LIVE = ['lines_vs_subtotal', 'lines_vs_grand_total'];
+
+// Fields the extraction may report missing that are optional unless the
+// organization requires them (backend label -> organization setting).
+const OPTIONAL_FIELDS: Record<string, api.ConfigurableRequiredField> = {
+  'Tax ID': 'vat_id',
+  Department: 'department',
+};
+
+function lineTotal(line: OrderLine): number {
+  const adjustment = line.priceAdjustmentPercent ?? 0;
+  return Math.round(line.unitPrice * line.amount * (1 + adjustment / 100) * 100) / 100;
+}
+
+function formatMoney(value: number): string {
+  return `$${value.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 export default function NewRequestPage() {
@@ -26,8 +65,108 @@ export default function NewRequestPage() {
   const [vatId, setVatId] = useState('');
   const [department, setDepartment] = useState('');
   const [commodityGroupId, setCommodityGroupId] = useState<number | null>(null);
+  // The group the AI suggested (to log it if the requester picks another one).
+  const [suggestedGroupId, setSuggestedGroupId] = useState<number | null>(null);
+  // Set when one of the organization's booking rules chose the group.
+  const [commodityRule, setCommodityRule] = useState<{ groupId: number; rule: string } | null>(
+    null
+  );
   const [orderLines, setOrderLines] = useState<OrderLine[]>([]);
-  const [totalCost, setTotalCost] = useState<number>(0);
+  // Shipping, tax and fees outside the lines; total = lines + these (the full
+  // amount Acme pays, which approval decisions depend on).
+  const [additionalCharges, setAdditionalCharges] = useState<number>(0);
+  // The uploaded quote's grand total, to check the form against while editing.
+  const [quoteTotal, setQuoteTotal] = useState<number | null>(null);
+  // Options the vendor offered instead of ordered items (not in the quote's total).
+  const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
+
+  const [checkingCatalog, setCheckingCatalog] = useState(false);
+  const [catalogCheckFailed, setCatalogCheckFailed] = useState(false);
+  const catalogRequestId = useRef(0);
+
+  const invalidateCatalog = () => {
+    // A vendor change or new upload also makes any in-flight lookup obsolete.
+    catalogRequestId.current += 1;
+    setCheckingCatalog(false);
+    setCatalogCheckFailed(false);
+    setOrderLines((current) => current.map((line) => ({
+      ...line, suggestions: undefined, catalogChecked: false,
+    })));
+  };
+
+  // Look up negotiated catalog prices for the given lines. Every line must be
+  // checked before the request can be created; if the check itself fails, the
+  // lines count as checked so the request is never blocked by an outage.
+  const checkCatalog = async (
+    lines: OrderLine[],
+    vendor: CatalogVendor
+  ) => {
+    const withText = lines.filter((line) => line.positionDescription.trim());
+    if (withText.length === 0) return;
+    const requestId = ++catalogRequestId.current;
+    const keys = withText.map((line) => catalogCheckKey(line, vendor));
+    setCheckingCatalog(true);
+    setCatalogCheckFailed(false);
+    let results: api.ArticleSuggestion[][] = withText.map(() => []);
+    let failed = false;
+    try {
+      const { suggestions } = await api.articles.suggest(
+        withText.map(({ positionDescription, unitPrice, amount, unit }) => ({
+          description: positionDescription, unitPrice, amount, unit,
+        })),
+        vendor
+      );
+      results = withText.map((_, i) => suggestions[i] ?? []);
+    } catch (err) {
+      console.error('Catalog check failed:', err);
+      failed = true;
+    } finally {
+      if (requestId === catalogRequestId.current) {
+        // Ignore responses for superseded vendors/uploads/lookups. For the
+        // current lookup, only apply results whose matching inputs still agree.
+        const byKey = new Map(keys.map((key, i) => [key, results[i]]));
+        setOrderLines((current) =>
+          current.map((line) => {
+            const key = catalogCheckKey(line, vendor);
+            return byKey.has(key)
+              ? { ...line, suggestions: byKey.get(key), catalogChecked: true }
+              : line;
+          })
+        );
+        setCatalogCheckFailed(failed);
+        setCheckingCatalog(false);
+      }
+    }
+  };
+
+  const { data: orgSettings } = useQuery({
+    queryKey: ['organization-settings'],
+    queryFn: () => api.organizations.getSettings(),
+  });
+
+  // Lines whose current matching inputs haven't been checked against the catalog yet.
+  const uncheckedLines = orderLines.filter(
+    (line) => line.positionDescription.trim() && !line.catalogChecked
+  );
+  const catalogPending = checkingCatalog || uncheckedLines.length > 0;
+
+  const totalCost =
+    Math.round(
+      (orderLines.reduce((sum, line) => sum + line.totalPrice, 0) + additionalCharges) * 100
+    ) / 100;
+
+  // Live check against the quote: if the form no longer adds up to the quote's
+  // total, say by how much and point at the line that explains the gap.
+  const totalsMismatch = useMemo(() => {
+    if (quoteTotal === null || Math.abs(totalCost - quoteTotal) <= CENTS_TOLERANCE) {
+      return null;
+    }
+    const difference = Math.round((totalCost - quoteTotal) * 100) / 100;
+    const suspects = orderLines
+      .map((line, index) => ({ line, index }))
+      .filter(({ line }) => Math.abs(line.totalPrice - difference) <= CENTS_TOLERANCE);
+    return { difference, suspectIndex: suspects.length === 1 ? suspects[0].index : null };
+  }, [orderLines, quoteTotal, totalCost]);
 
   // UI state
   const [file, setFile] = useState<File | null>(null);
@@ -35,6 +174,8 @@ export default function NewRequestPage() {
   const [success, setSuccess] = useState('');
   const [warning, setWarning] = useState('');
   const [extracting, setExtracting] = useState(false);
+  // Nothing can be submitted while the PDF is read or the catalog checked.
+  const submitBlocked = extracting || catalogPending;
 
   // PDF parsing mutation
   const parsePDFMutation = useMutation({
@@ -52,22 +193,29 @@ export default function NewRequestPage() {
     const uploadedFile = e.target.files?.[0];
     if (!uploadedFile) return;
 
-    if (uploadedFile.type !== 'application/pdf') {
+    // Browsers leave the MIME type empty for some files (e.g. "Quote.Pdf"), so
+    // also accept by extension; the backend verifies the actual file bytes.
+    const isPdf =
+      uploadedFile.type === 'application/pdf' || /\.pdf$/i.test(uploadedFile.name);
+    if (!isPdf) {
       setError('Please upload a PDF file');
       return;
     }
 
     setFile(uploadedFile);
+    invalidateCatalog();
     setError('');
     setSuccess('');
     setWarning('');
+    setQuoteTotal(null);
+    setAlternatives([]);
     setExtracting(true);
 
     try {
       // Step 1: Parse PDF
       const pdfText = await parsePDFMutation.mutateAsync(uploadedFile);
 
-      // Step 2: Extract structured data AND classify commodity group in one AI call
+      // Step 2: Extract structured data and classify the commodity group
       const extractionResult = await api.extraction.extract(pdfText);
       
       if (!extractionResult.success || !extractionResult.data) {
@@ -82,21 +230,44 @@ export default function NewRequestPage() {
       setVatId(extracted.vatId || '');
       setDepartment(extracted.department || '');
       setOrderLines(extracted.orderLines || []);
-      setTotalCost(extracted.totalCost || 0);
-      
+      setAdditionalCharges(extracted.additionalCharges || 0);
+      setQuoteTotal(extracted.totalCost ?? null);
+      setAlternatives(extracted.alternatives || []);
+
       // Set commodity group (now included in extraction)
       if (extracted.commodityGroupId) {
         setCommodityGroupId(extracted.commodityGroupId);
       }
+      setSuggestedGroupId(extracted.commodityGroupId ?? null);
+      setCommodityRule(
+        extracted.commodityRule && extracted.commodityGroupId
+          ? { groupId: extracted.commodityGroupId, rule: extracted.commodityRule }
+          : null
+      );
 
-      // Show warnings for missing fields
-      if (extractionResult.missingFields && extractionResult.missingFields.length > 0) {
-        setWarning(
-          `⚠️ Could not extract: ${extractionResult.missingFields.join(', ')}. Please fill in these fields manually.`
-        );
+      // Missing fields: only those the request actually needs. Optional fields
+      // (e.g. Department, rarely on a quote) are simply left empty.
+      const required = orgSettings?.required_fields ?? [];
+      const missing = (extractionResult.missingFields ?? []).filter((label) => {
+        const optional = OPTIONAL_FIELDS[label];
+        return !optional || required.includes(optional);
+      });
+      const warnings: string[] = [];
+      if (missing.length > 0) {
+        warnings.push(`⚠️ Not found on the quote: ${missing.join(', ')}. Please fill these in.`);
       }
+      for (const issue of extractionResult.warnings ?? []) {
+        if (!TOTALS_CHECKED_LIVE.includes(issue.code)) {
+          warnings.push(`⚠️ Please double-check: ${issue.message}`);
+        }
+      }
+      setWarning(warnings.join('\n'));
 
       setSuccess('✓ PDF extracted successfully! Review and submit.');
+      void checkCatalog(extracted.orderLines || [], {
+        vendorName: extracted.vendorName ?? undefined,
+        vendorTaxId: extracted.vatId ?? undefined,
+      });
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch (err) {
       console.error('Extraction error:', err);
@@ -125,25 +296,32 @@ export default function NewRequestPage() {
   const updateOrderLine = (index: number, field: keyof OrderLine, value: string | number) => {
     const updated = [...orderLines];
     updated[index] = { ...updated[index], [field]: value };
-    
-    // Auto-calculate total price
-    if (field === 'unitPrice' || field === 'amount') {
-      updated[index].totalPrice = updated[index].unitPrice * updated[index].amount;
+    if (field === 'positionDescription' || field === 'unit' || field === 'unitPrice') {
+      // These inputs affect product matching, unit comparison and price filters.
+      updated[index].suggestions = undefined;
+      updated[index].catalogChecked = false;
     }
     
+    // Auto-calculate total price (keeping the quote's discount/surcharge)
+    if (field === 'unitPrice' || field === 'amount' || field === 'priceAdjustmentPercent') {
+      updated[index].totalPrice = lineTotal(updated[index]);
+    }
+
     setOrderLines(updated);
-    
-    // Update total cost
-    const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
+  };
+
+  // Order an alternative the vendor offered. The quote's printed total (and its
+  // tax) no longer applies, so stop checking against it rather than raise a
+  // false "doesn't add up" warning.
+  const orderAlternative = (index: number) => {
+    setOrderLines([...orderLines, alternatives[index]]);
+    setAlternatives(alternatives.filter((_, i) => i !== index));
+    setQuoteTotal(null);
   };
 
   // Remove order line
   const removeOrderLine = (index: number) => {
-    const updated = orderLines.filter((_, i) => i !== index);
-    setOrderLines(updated);
-    const newTotal = updated.reduce((sum, line) => sum + line.totalPrice, 0);
-    setTotalCost(newTotal);
+    setOrderLines(orderLines.filter((_, i) => i !== index));
   };
 
   // Submit form
@@ -157,6 +335,16 @@ export default function NewRequestPage() {
     if (!commodityGroupId) {
       setError('Please select a commodity group');
       window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+
+    if (extracting) {
+      setError('Please wait until the PDF has been read');
+      return;
+    }
+
+    if (catalogPending) {
+      setError('Please check negotiated prices for all order lines first');
       return;
     }
 
@@ -175,7 +363,16 @@ export default function NewRequestPage() {
         commodityGroupId: commodityGroupId,
         totalCost,
         department,
-        orderLines,
+        orderLines: orderLines.map(({ positionDescription, unitPrice, amount, unit, totalPrice }) => ({
+          positionDescription, unitPrice, amount, unit, totalPrice,
+        })),
+        suggestedCommodityGroupId: suggestedGroupId,
+        // Pass on what the requester was shown, so the approver sees it too.
+        catalogAlternatives: orderLines.flatMap((line, lineIndex) =>
+          line.suggestions?.length
+            ? [{ lineIndex, articleIds: line.suggestions.map((s) => s.article_id) }]
+            : []
+        ),
       });
 
       // Attach the original PDF (if one was uploaded) so it shows on the detail page.
@@ -210,7 +407,13 @@ export default function NewRequestPage() {
       </div>
 
       {error && <Alert variant="error" className="mb-6">{error}</Alert>}
-      {warning && <Alert variant="warning" className="mb-6">{warning}</Alert>}
+      {warning && <Alert variant="warning" className="mb-6 whitespace-pre-line">{warning}</Alert>}
+      {totalsMismatch && (
+        <Alert variant="warning" className="mb-6">
+          ⚠️ The order lines don&apos;t add up to the quote&apos;s total — see the note under Total Cost
+          {totalsMismatch.suspectIndex !== null ? ' and the highlighted line' : ''}.
+        </Alert>
+      )}
       {success && <Alert variant="success" className="mb-6">{success}</Alert>}
 
       <form onSubmit={handleSubmit} className="space-y-8">
@@ -224,7 +427,7 @@ export default function NewRequestPage() {
           <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-accent-deep/50 transition-colors">
             <input
               type="file"
-              accept="application/pdf"
+              accept="application/pdf,.pdf"
               onChange={handleFileChange}
               className="hidden"
               id="pdf-upload"
@@ -317,7 +520,10 @@ export default function NewRequestPage() {
             <Input
               label="Vendor Name *"
               value={vendorName}
-              onChange={(e) => setVendorName(e.target.value)}
+              onChange={(e) => {
+                setVendorName(e.target.value);
+                invalidateCatalog();
+              }}
               required
               placeholder="Adobe Systems"
             />
@@ -325,7 +531,10 @@ export default function NewRequestPage() {
             <Input
               label="Tax ID"
               value={vatId}
-              onChange={(e) => setVatId(e.target.value)}
+              onChange={(e) => {
+                setVatId(e.target.value);
+                invalidateCatalog();
+              }}
               placeholder="12-3456789"
             />
           </div>
@@ -349,6 +558,12 @@ export default function NewRequestPage() {
                 </option>
               ))}
             </select>
+            {commodityRule && commodityRule.groupId === commodityGroupId && (
+              <p className="mt-2 text-sm text-gray-600">
+                Set by your organization&apos;s booking rule for &ldquo;{commodityRule.rule}&rdquo;.
+                You can change it if this purchase is an exception.
+              </p>
+            )}
           </div>
         </div>
 
@@ -356,9 +571,24 @@ export default function NewRequestPage() {
         <div className="lio-card p-6">
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold tracking-tight text-ink">Order Lines *</h2>
-            <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
-              + Add Line
-            </Button>
+            <div className="flex gap-2">
+              {catalogPending && (
+                // Only offered when there is something new to check.
+                <Button
+                  type="button"
+                  onClick={() => checkCatalog(uncheckedLines, { vendorName, vendorTaxId: vatId })}
+                  size="sm"
+                  loading={checkingCatalog}
+                >
+                  {checkingCatalog
+                    ? 'Checking catalog…'
+                    : `Check negotiated prices (${uncheckedLines.length})`}
+                </Button>
+              )}
+              <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
+                + Add Line
+              </Button>
+            </div>
           </div>
 
           {orderLines.length === 0 ? (
@@ -368,9 +598,32 @@ export default function NewRequestPage() {
           ) : (
             <div className="space-y-4">
               {orderLines.map((line, index) => (
-                <div key={index} className="border border-gray-200 rounded-lg p-4">
+                <div
+                  key={index}
+                  className={`border rounded-lg p-4 ${
+                    totalsMismatch?.suspectIndex === index
+                      ? 'border-amber-400 bg-amber-50'
+                      : 'border-gray-200'
+                  }`}
+                >
                   <div className="flex items-start justify-between mb-4">
-                    <h3 className="text-sm font-medium text-gray-700">Line {index + 1}</h3>
+                    <h3 className="text-sm font-medium text-gray-700 flex items-center gap-2">
+                      Line {index + 1}
+                      {line.positionDescription.trim() &&
+                        (line.catalogChecked ? (
+                          <span className="text-xs font-normal text-green-700">
+                            ✓ Catalog checked
+                          </span>
+                        ) : checkingCatalog ? (
+                          <span className="text-xs font-normal text-gray-500">
+                            Checking catalog…
+                          </span>
+                        ) : (
+                          <span className="text-xs font-normal text-amber-700">
+                            Catalog not checked yet
+                          </span>
+                        ))}
+                    </h3>
                     <button
                       type="button"
                       onClick={() => removeOrderLine(index)}
@@ -380,7 +633,7 @@ export default function NewRequestPage() {
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4">
                     <div className="lg:col-span-2">
                       <Input
                         label="Description"
@@ -422,32 +675,221 @@ export default function NewRequestPage() {
                       required
                       placeholder="pcs, licenses, etc."
                     />
+
+                    {/* Shown as a positive discount; stored signed (−20 = 20% off). */}
+                    <Input
+                      label="Discount %"
+                      type="number"
+                      step="0.01"
+                      value={line.priceAdjustmentPercent ? -line.priceAdjustmentPercent : ''}
+                      onChange={(e) => {
+                        const discount = parseFloat(e.target.value);
+                        updateOrderLine(
+                          index,
+                          'priceAdjustmentPercent',
+                          Number.isNaN(discount) || discount === 0 ? 0 : -discount
+                        );
+                      }}
+                      placeholder="0"
+                    />
                   </div>
 
-                  <div className="mt-2 text-right">
-                    <span className="text-sm text-gray-600">Total: </span>
-                    <span className="text-lg font-semibold tracking-tight text-ink">
-                      ${line.totalPrice.toFixed(2)}
+                  {line.suggestions && line.suggestions.length > 0 && (
+                    <div className="mt-3 overflow-hidden rounded-lg border border-emerald-200 border-l-4 border-l-emerald-500 bg-emerald-50/60">
+                      <p
+                        className="px-3 py-2 text-sm text-emerald-900"
+                        title="To use a negotiated price, raise this request with that supplier as the vendor."
+                      >
+                        <span className="font-medium">Negotiated prices in your catalog</span>
+                        {line.suggestions[0].matched_as && (
+                          <span className="text-emerald-800/70">
+                            {' '}
+                            · matched as &ldquo;{line.suggestions[0].matched_as}&rdquo; · review
+                            before switching
+                          </span>
+                        )}
+                      </p>
+                      <ul className="divide-y divide-emerald-100 bg-white">
+                        {line.suggestions.map((s) => {
+                          // Compare with what is actually paid per unit, after the line's discount.
+                          const effectivePrice = line.unitPrice * (1 + (line.priceAdjustmentPercent ?? 0) / 100);
+                          const difference = s.unit_price - effectivePrice;
+                          // A signed, coloured difference only for an identical product;
+                          // anything else gets the quote's price as neutral context.
+                          const identical =
+                            s.match === 'same' && s.same_unit && s.scope === 'same' &&
+                            line.unitPrice > 0;
+                          const comparable = identical;
+                          return (
+                            <li
+                              key={s.article_id}
+                              className="px-3 py-2 flex items-center justify-between gap-4"
+                            >
+                              <div className="min-w-0">
+                                <p className="text-sm font-medium text-ink truncate">
+                                  {s.supplier_name}
+                                  {s.same_vendor && (
+                                    <span className="ml-2 rounded bg-green-100 px-1.5 py-0.5 text-xs font-medium text-green-800">
+                                      This vendor
+                                    </span>
+                                  )}
+                                </p>
+                                <p className="text-xs text-gray-500 truncate">
+                                  {s.description} · {s.article_number}
+                                </p>
+                              </div>
+                              <div className="text-right shrink-0">
+                                <p className="text-sm font-semibold text-ink">
+                                  {formatMoney(s.unit_price)}
+                                  <span className="font-normal text-gray-500">/{s.unit}</span>
+                                </p>
+                                {comparable && (
+                                  <span
+                                    className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
+                                      difference < 0
+                                        ? 'bg-emerald-100 text-emerald-800'
+                                        : 'bg-gray-100 text-gray-600'
+                                    }`}
+                                  >
+                                    {difference < 0 ? '−' : '+'}
+                                    {formatMoney(Math.abs(difference))} vs quote
+                                  </span>
+                                )}
+                                {!identical && s.same_unit && s.scope === 'same' && line.unitPrice > 0 && (
+                                  <p className="text-xs text-gray-500">
+                                    {formatMoney(effectivePrice)} on this quote
+                                  </p>
+                                )}
+                                {s.scope !== 'same' && (
+                                  <p className="text-xs text-gray-500 max-w-[14rem]">
+                                    Not directly comparable — covers a different scope
+                                  </p>
+                                )}
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  )}
+
+                  <div className="mt-2 flex items-center justify-between gap-4">
+                    <span className="text-sm text-amber-800">
+                      {totalsMismatch?.suspectIndex === index &&
+                        "Not part of the quote's total — probably an alternative or optional item."}
+                    </span>
+                    <span>
+                      <span className="text-sm text-gray-600">Total: </span>
+                      <span className="text-lg font-semibold tracking-tight text-ink">
+                        {formatMoney(line.totalPrice)}
+                      </span>
                     </span>
                   </div>
                 </div>
               ))}
             </div>
           )}
+
+          {alternatives.length > 0 && (
+            <div className="mt-4 border border-dashed border-gray-300 rounded-lg p-4">
+              <h3 className="text-sm font-medium text-gray-700">
+                Alternatives offered on this quote
+              </h3>
+              <p className="text-xs text-gray-500 mb-3">
+                Not included in the quote&apos;s total. Use one to add it to the order, then
+                remove the line it replaces and check shipping, tax &amp; fees.
+              </p>
+              <ul className="space-y-2">
+                {alternatives.map((alternative, index) => (
+                  <li key={index} className="flex items-center justify-between gap-4">
+                    <span className="text-sm text-gray-800">{alternative.positionDescription}</span>
+                    <span className="flex items-center gap-3 shrink-0">
+                      <span className="text-sm font-medium text-ink">
+                        {formatMoney(alternative.totalPrice)}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => orderAlternative(index)}
+                      >
+                        Use this
+                      </Button>
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+            <p className="text-sm text-gray-600">
+              Shipping, tax and fees charged on the quote outside the line items.
+            </p>
+            <Input
+              label="Shipping, tax & fees ($)"
+              type="number"
+              step="0.01"
+              value={additionalCharges}
+              onChange={(e) => setAdditionalCharges(parseFloat(e.target.value) || 0)}
+            />
+          </div>
         </div>
 
         {/* Total Cost */}
-        <div className="bg-accent-soft/20 border-2 border-accent/40 rounded-lg p-6">
+        <div className="bg-accent-soft/20 border-2 border-accent/40 rounded-lg p-6 space-y-3">
           <div className="flex items-center justify-between">
             <span className="text-lg font-medium text-gray-900">Total Cost</span>
             <span className="text-3xl font-bold text-accent-deep">
-              ${totalCost.toFixed(2)}
+              {formatMoney(totalCost)}
             </span>
           </div>
+          {orgSettings?.auto_approve_below && totalCost > 0 && (
+            <div className="flex items-center justify-between gap-4">
+              <span className="text-sm text-gray-600">
+                Approval limit: {formatMoney(orgSettings.auto_approve_below)}
+              </span>
+              {totalCost < orgSettings.auto_approve_below ? (
+                <span className="rounded-full bg-emerald-100 px-3 py-1 text-sm font-medium text-emerald-800">
+                  ✓ Below the limit — approved automatically
+                </span>
+              ) : (
+                <span className="rounded-full bg-amber-100 px-3 py-1 text-sm font-medium text-amber-800">
+                  Needs buyer approval
+                </span>
+              )}
+            </div>
+          )}
+          {totalsMismatch && quoteTotal !== null && (
+            <Alert variant="warning">
+              {totalsMismatch.suspectIndex !== null
+                ? `Line ${totalsMismatch.suspectIndex + 1} ("${
+                    orderLines[totalsMismatch.suspectIndex].positionDescription
+                  }", ${formatMoney(totalsMismatch.difference)}) isn't included in the quote's total of ${formatMoney(
+                    quoteTotal
+                  )}. It's probably an alternative or optional item — remove it if you're not ordering it.`
+                : `This adds up to ${formatMoney(totalCost)}, but the quote's total is ${formatMoney(
+                    quoteTotal
+                  )} (difference ${formatMoney(totalsMismatch.difference)}). Please check the lines against the quote.`}
+            </Alert>
+          )}
         </div>
 
         {/* Submit */}
         <div className="flex items-center justify-end space-x-4">
+          {extracting ? (
+            <span className="text-sm text-amber-700">Reading the PDF…</span>
+          ) : catalogPending ? (
+            <span className="text-sm text-amber-700">
+              {checkingCatalog
+                ? 'Checking negotiated prices…'
+                : 'Check negotiated prices for new or changed lines first'}
+            </span>
+          ) : catalogCheckFailed ? (
+            <span className="text-sm text-gray-500">
+              Couldn&apos;t reach the catalog — you can still create the request.
+            </span>
+          ) : null}
           <Button
             type="button"
             variant="outline"
@@ -455,7 +897,7 @@ export default function NewRequestPage() {
           >
             Cancel
           </Button>
-          <Button type="submit" size="lg">
+          <Button type="submit" size="lg" disabled={submitBlocked}>
             Create Request
           </Button>
         </div>

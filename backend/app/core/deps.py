@@ -64,6 +64,16 @@ def get_current_membership(
     return membership
 
 
+def get_optional_membership(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> OrganizationMember | None:
+    """The user's membership, or None for a signed-in user without an organization."""
+    return db.scalar(
+        select(OrganizationMember).where(OrganizationMember.user_id == user.id)
+    )
+
+
 def require_org_admin(
     membership: OrganizationMember = Depends(get_current_membership),
 ) -> OrganizationMember:

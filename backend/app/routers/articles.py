@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session, joinedload
 from app.core.deps import get_current_membership
 from app.db.session import get_db
 from app.models import Article, OrganizationMember
-from app.schemas.articles import ArticleOut, ArticlePage
+from app.schemas.articles import ArticleOut, ArticlePage, SuggestionRequest, SuggestionResponse
+from app.services.catalog_matching import suggest_articles
 
 router = APIRouter(prefix="/articles", tags=["articles"])
 
@@ -74,3 +75,21 @@ def count_articles(
         or 0
     )
     return {"count": total}
+
+
+@router.post("/suggestions", response_model=SuggestionResponse)
+def suggest_for_lines(
+    payload: SuggestionRequest,
+    membership: OrganizationMember = Depends(get_current_membership),
+    db: Session = Depends(get_db),
+) -> SuggestionResponse:
+    """Negotiated catalog articles matching each request line (own organization only)."""
+    return SuggestionResponse(
+        suggestions=suggest_articles(
+            payload.lines,
+            membership.organization_id,
+            db,
+            vendor_name=payload.vendor_name,
+            vendor_tax_id=payload.vendor_tax_id,
+        )
+    )

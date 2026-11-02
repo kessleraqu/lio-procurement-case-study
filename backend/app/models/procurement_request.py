@@ -63,6 +63,10 @@ class ProcurementRequest(Base, TimestampMixin):
     # Financial
     total_cost: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
 
+    # Negotiated catalog articles suggested at creation (snapshot for the
+    # approver; see services/catalog_matching.snapshot_alternatives).
+    catalog_alternatives: Mapped[list | None] = mapped_column(JSON, nullable=True)
+
     # Multi-tenancy (added in migration 003, nullable for backward compatibility)
     organization_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True

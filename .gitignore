@@ -37,6 +37,8 @@ extra/
 .claude/
 CLAUDE.local.md
 skills-lock.json
+DECISIONS.md
+PR_DESCRIPTION.md
 
 # Local extraction test scenarios (quote fixtures, live evals, scorecard)
 backend/tests/quote_scenarios.py
@@ -44,3 +46,4 @@ backend/tests/test_extraction_scenarios.py
 backend/tests/test_extraction_live.py
 backend/tests/fixtures/
 backend/scripts/eval_extraction.py
+backend/scripts/eval_matching.py

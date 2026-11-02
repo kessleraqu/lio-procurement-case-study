@@ -397,8 +397,9 @@ def test_pdf_parse():
         files={"file": ("offer.pdf", buf.getvalue(), "application/pdf")},
         headers=_auth(token),
     )
-    assert r.status_code == 200, r.text
-    assert "text" in r.json()  # blank page -> empty text, but parses fine
+    # A blank page has no text layer -> treated like a scan, with a clear message.
+    assert r.status_code == 422, r.text
+    assert "scanned" in r.json()["detail"]
 
     # non-PDF rejected
     r = client.post(
@@ -419,9 +420,9 @@ def test_activity_log_and_document():
     payload = {
         "requestorName": "Alex Admin", "titleShortDescription": "Chairs",
         "vendorName": "FurnitureCo", "vatId": "12-0000001", "commodityGroupId": 15,
-        "totalCost": 500.0, "department": "Ops",
+        "totalCost": 5000.0, "department": "Ops",
         "orderLines": [
-            {"positionDescription": "Chair", "unitPrice": 250, "amount": 2, "unit": "pc", "totalPrice": 500}
+            {"positionDescription": "Chair", "unitPrice": 2500, "amount": 2, "unit": "pc", "totalPrice": 5000}
         ],
     }
     rid = client.post("/requests", json=payload, headers=_auth(admin)).json()["id"]
@@ -429,20 +430,20 @@ def test_activity_log_and_document():
     # edit two fields -> one 'updated' activity naming those fields
     updated = dict(payload)
     updated["title"] = "Office Chairs"
-    updated["totalCost"] = 600.0
+    updated["totalCost"] = 6000.0
     updated["orderLines"] = [
-        {"positionDescription": "Chair", "unitPrice": 300, "amount": 2, "unit": "pc", "totalPrice": 600}
+        {"positionDescription": "Chair", "unitPrice": 3000, "amount": 2, "unit": "pc", "totalPrice": 6000}
     ]
     # RequestUpdate uses "title" (not titleShortDescription)
     updated = {
         "requestorName": "Alex Admin", "title": "Office Chairs", "vendorName": "FurnitureCo",
-        "vatId": "12-0000001", "commodityGroupId": 15, "totalCost": 600.0, "department": "Ops",
+        "vatId": "12-0000001", "commodityGroupId": 15, "totalCost": 6000.0, "department": "Ops",
         "orderLines": updated["orderLines"],
     }
     r = client.put(f"/requests/{rid}", json=updated, headers=_auth(admin))
     assert r.status_code == 200, r.text
 
-    # approve, then a status change
+    # approve (above Acme's $2,000 auto-approval limit, so a buyer decides), then a status change
     client.patch(f"/requests/{rid}/approval", json={"decision": "approved"}, headers=_auth(admin))
     client.patch(f"/requests/{rid}/status", json={"status": "closed"}, headers=_auth(admin))
 
@@ -506,7 +507,8 @@ def test_commodity_groups_expanded():
     # Large taxonomy.
     assert len(groups) >= 1000, f"expected a large taxonomy, got {len(groups)}"
     # ids contiguous from 1; first one matches the original taxonomy
-    assert groups[0] == {"id": 1, "category": "General Services", "name": "Accommodation Rentals"}
+    assert groups[0] == {"id": 1, "category": "General Services", "name": "Accommodation Rentals",
+                         "organization_id": None}
     assert len({g["category"] for g in groups}) >= 20
 
     # Every leaf name belongs to exactly one category.
@@ -730,7 +732,8 @@ def test_org_settings_required_fields():
     # Default settings: nothing extra required.
     r = client.get("/organizations/me/settings", headers=_auth(token))
     assert r.status_code == 200
-    assert r.json() == {"required_fields": []}
+    assert r.json() == {"required_fields": [], "commodity_rules": [],
+                        "correction_alert_threshold": 3, "auto_approve_below": None}
 
     base_payload = {
         "requestorName": "S", "titleShortDescription": "T", "vendorName": "V",
@@ -824,3 +827,196 @@ if __name__ == "__main__":
     test_org_settings_required_fields()
     test_org_settings_admin_only()
     print("ALL SMOKE TESTS PASSED")
+
+
+def test_catalog_alternatives_reach_the_approver():
+    admin = client.post(
+        "/auth/signin", json={"email": "admin@acme.com", "password": "demo1234"}
+    ).json()["access_token"]
+    with TestingSession() as s:
+        article = s.scalar(select(Article).where(Article.article_number == "HUD-00001"))
+    payload = {
+        "requestorName": "Alex Admin", "titleShortDescription": "Docking stations",
+        "vendorName": "Random Vendor", "commodityGroupId": 29, "totalCost": 700.0,
+        "orderLines": [{"positionDescription": "USB-C dock", "unitPrice": 350, "amount": 2,
+                        "unit": "piece", "totalPrice": 700}],
+        "catalogAlternatives": [{"lineIndex": 0, "articleIds": [str(article.id)]}],
+    }
+    created = client.post("/requests", json=payload, headers=_auth(admin)).json()
+
+    [alt] = created["catalog_alternatives"]
+    assert alt["quoted_unit_price"] == 350
+    assert alt["options"][0]["article_number"] == "HUD-00001"
+    assert alt["options"][0]["supplier_name"] == "Hudson Systems Inc."
+    activity = client.get(f"/requests/{created['id']}/activity", headers=_auth(admin)).json()
+    assert any(a["action"] == "catalog_alternatives" for a in activity)
+
+
+def test_organization_groups_and_rules_are_tenant_scoped():
+    acme = client.post("/auth/signin", json={"email": "admin@acme.com",
+                                             "password": "demo1234"}).json()["access_token"]
+    walmart = client.post("/auth/signin", json={"email": "admin@walmart.com",
+                                                "password": "demo1234"}).json()["access_token"]
+    acme_groups = {g["name"]: g["id"] for g in
+                   client.get("/commodity-groups", headers=_auth(acme)).json()}
+    walmart_names = {g["name"] for g in
+                     client.get("/commodity-groups", headers=_auth(walmart)).json()}
+    office_supplies = acme_groups["Office Supplies"]
+    assert "Office Supplies" not in walmart_names
+
+    # Another tenant can neither book on Acme's group nor point a rule at it.
+    payload = {
+        "requestorName": "W", "titleShortDescription": "Paper", "vendorName": "V",
+        "commodityGroupId": office_supplies, "totalCost": 10.0,
+        "orderLines": [{"positionDescription": "Paper", "unitPrice": 10, "amount": 1,
+                        "unit": "pack", "totalPrice": 10}],
+    }
+    assert client.post("/requests", json=payload, headers=_auth(walmart)).status_code == 422
+    assert client.post("/requests", json=payload, headers=_auth(acme)).status_code == 201
+    r = client.patch("/organizations/me/settings", headers=_auth(walmart), json={
+        "commodity_rules": [{"applies_to": "paper", "commodity_group_id": office_supplies}]})
+    assert r.status_code == 422
+
+    # Saving only required_fields (as the Organization page does) keeps the rules.
+    rules = client.get("/organizations/me/settings", headers=_auth(acme)).json()[
+        "commodity_rules"]
+    assert {r["applies_to"] for r in rules} == {"cable ties", "printer toner",
+                                                "software subscriptions"}
+    r = client.patch("/organizations/me/settings", headers=_auth(acme),
+                     json={"required_fields": []})
+    assert r.status_code == 200 and r.json()["commodity_rules"] == rules
+
+
+def test_repeated_group_corrections_are_shown_to_admins():
+    admin = client.post("/auth/signin", json={"email": "admin@acme.com",
+                                              "password": "demo1234"}).json()["access_token"]
+    requester = client.post("/auth/signin", json={"email": "requester@acme.com",
+                                                  "password": "demo1234"}).json()["access_token"]
+
+    def create(title, suggested, chosen):
+        payload = {
+            "requestorName": "R", "titleShortDescription": title, "vendorName": "V",
+            "commodityGroupId": chosen, "suggestedCommodityGroupId": suggested,
+            "totalCost": 50.0,
+            "orderLines": [{"positionDescription": title, "unitPrice": 50, "amount": 1,
+                            "unit": "piece", "totalPrice": 50}],
+        }
+        assert client.post("/requests", json=payload, headers=_auth(requester)).status_code == 201
+
+    # AI suggested 22 (Printing Costs), requester chose 30 (IT Services): 3 times.
+    for i in range(3):
+        create(f"Printer repair {i}", suggested=22, chosen=30)
+    # Below the default threshold of 3: twice 15 -> 14.
+    for i in range(2):
+        create(f"Office move {i}", suggested=15, chosen=14)
+    create("Accepted as suggested", suggested=31, chosen=31)  # no correction
+
+    patterns = client.get("/organizations/me/commodity-corrections",
+                          headers=_auth(admin)).json()
+    assert [(p["suggested"]["id"], p["chosen"]["id"], p["count"]) for p in patterns] == [
+        (22, 30, 3)]
+    assert set(patterns[0]["examples"]) == {f"Printer repair {i}" for i in range(3)}
+
+    # The admin lowers the threshold; the second pattern appears.
+    client.patch("/organizations/me/settings", headers=_auth(admin),
+                 json={"correction_alert_threshold": 2})
+    patterns = client.get("/organizations/me/commodity-corrections",
+                          headers=_auth(admin)).json()
+    assert {(p["suggested"]["id"], p["chosen"]["id"]) for p in patterns} == {(22, 30), (15, 14)}
+    client.patch("/organizations/me/settings", headers=_auth(admin),
+                 json={"correction_alert_threshold": 3})
+
+    # Admins only.
+    assert client.get("/organizations/me/commodity-corrections",
+                      headers=_auth(requester)).status_code == 403
+
+
+def test_admins_manage_their_own_commodity_groups():
+    acme = client.post("/auth/signin", json={"email": "admin@acme.com",
+                                             "password": "demo1234"}).json()["access_token"]
+    walmart = client.post("/auth/signin", json={"email": "admin@walmart.com",
+                                                "password": "demo1234"}).json()["access_token"]
+    requester = client.post("/auth/signin", json={"email": "requester@acme.com",
+                                                  "password": "demo1234"}).json()["access_token"]
+    body = {"category": "Office & Administration", "name": "Desk Plants"}
+
+    assert client.post("/commodity-groups", json=body,
+                       headers=_auth(requester)).status_code == 403  # admins only
+    group = client.post("/commodity-groups", json=body, headers=_auth(acme)).json()
+    assert group["id"] >= 100_000 and group["organization_id"]  # own code range
+    assert client.post("/commodity-groups", json=body,
+                       headers=_auth(acme)).status_code == 409  # name taken
+    assert client.post("/commodity-groups", json={**body, "name": "Hardware"},
+                       headers=_auth(acme)).status_code == 409  # clashes with a shared one
+
+    names = lambda token: {g["name"] for g in  # noqa: E731
+                           client.get("/commodity-groups", headers=_auth(token)).json()}
+    assert "Desk Plants" in names(acme) and "Desk Plants" not in names(walmart)
+
+    # Rename keeps the code; other tenants and shared groups can't be changed.
+    renamed = client.put(f"/commodity-groups/{group['id']}", headers=_auth(acme),
+                         json={**body, "name": "Office Plants"}).json()
+    assert renamed["id"] == group["id"] and renamed["name"] == "Office Plants"
+    assert client.put(f"/commodity-groups/{group['id']}", json=body,
+                      headers=_auth(walmart)).status_code == 404
+    assert client.delete("/commodity-groups/29", headers=_auth(acme)).status_code == 404
+
+    # In use by a request -> can't delete; unused -> deleted.
+    payload = {
+        "requestorName": "A", "titleShortDescription": "Ficus", "vendorName": "V",
+        "commodityGroupId": group["id"], "totalCost": 40.0,
+        "orderLines": [{"positionDescription": "Ficus", "unitPrice": 40, "amount": 1,
+                        "unit": "piece", "totalPrice": 40}],
+    }
+    rid = client.post("/requests", json=payload, headers=_auth(acme)).json()["id"]
+    r = client.delete(f"/commodity-groups/{group['id']}", headers=_auth(acme))
+    assert r.status_code == 409 and "1 request" in r.json()["detail"]
+    client.delete(f"/requests/{rid}", headers=_auth(acme))
+    assert client.delete(f"/commodity-groups/{group['id']}",
+                         headers=_auth(acme)).status_code == 204
+    assert "Office Plants" not in names(acme)
+
+
+def test_requests_below_the_limit_need_no_approval():
+    acme = client.post("/auth/signin", json={"email": "admin@acme.com",
+                                             "password": "demo1234"}).json()["access_token"]
+    walmart = client.post("/auth/signin", json={"email": "admin@walmart.com",
+                                                "password": "demo1234"}).json()["access_token"]
+    assert client.get("/organizations/me/settings",
+                      headers=_auth(acme)).json()["auto_approve_below"] == 2000.0
+
+    def body(total, title="Desk lamps"):
+        return {
+            "requestorName": "A", "titleShortDescription": title, "title": title,
+            "vendorName": "V", "commodityGroupId": 15, "totalCost": total,
+            "orderLines": [{"positionDescription": title, "unitPrice": total, "amount": 1,
+                            "unit": "piece", "totalPrice": total}],
+        }
+
+    def actions(rid, token=acme):
+        return [a["action"] for a in
+                client.get(f"/requests/{rid}/activity", headers=_auth(token)).json()]
+
+    below = client.post("/requests", json=body(1686.14), headers=_auth(acme)).json()
+    assert below["approval_status"] == "approved" and below["approved_by"] is None
+    assert "auto_approved" in actions(below["id"])
+
+    at_limit = client.post("/requests", json=body(2000.0), headers=_auth(acme)).json()
+    assert at_limit["approval_status"] == "pending"  # "below" $2,000, not "up to"
+
+    # Edits: the auto-approval follows the total in both directions.
+    r = client.put(f"/requests/{below['id']}", json=body(2042.15), headers=_auth(acme)).json()
+    assert r["approval_status"] == "pending" and "approval_required" in actions(below["id"])
+    r = client.put(f"/requests/{at_limit['id']}", json=body(1500.0), headers=_auth(acme)).json()
+    assert r["approval_status"] == "approved"
+
+    # A buyer's own decision is never undone by an edit.
+    big = client.post("/requests", json=body(18402.5), headers=_auth(acme)).json()
+    client.patch(f"/requests/{big['id']}/approval", json={"decision": "approved"},
+                 headers=_auth(acme))
+    r = client.put(f"/requests/{big['id']}", json=body(500.0), headers=_auth(acme)).json()
+    assert r["approval_status"] == "approved" and r["approved_by"] is not None
+
+    # No limit configured -> every request needs approval (the old behaviour).
+    other = client.post("/requests", json=body(10.0), headers=_auth(walmart)).json()
+    assert other["approval_status"] == "pending"

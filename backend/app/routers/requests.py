@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session, selectinload
 from app.core.deps import get_current_membership, require_buyer_or_admin
 from app.db.session import get_db
 from app.models import (
-    CommodityGroup,
     OrderLine,
     Organization,
     OrganizationMember,
@@ -16,6 +15,7 @@ from app.models import (
     RequestActivity,
     RequestDocument,
 )
+from app.schemas.organizations import OrganizationSettings
 from app.schemas.requests import (
     ApprovalDecision,
     RequestActivityOut,
@@ -24,10 +24,11 @@ from app.schemas.requests import (
     RequestUpdate,
     StatusUpdate,
 )
+from app.services.catalog_matching import snapshot_alternatives
+from app.services.commodity_groups import get_visible_group
+from app.services.uploads import read_pdf_upload
 
 router = APIRouter(prefix="/requests", tags=["requests"])
-
-MAX_PDF_BYTES = 10 * 1024 * 1024
 
 # Human-readable labels for the fields we track in the activity log.
 _FIELD_LABELS = {
@@ -70,8 +71,11 @@ def _get_org_request(
     return request
 
 
-def _validate_commodity_group(db: Session, commodity_group_id: int) -> None:
-    if db.get(CommodityGroup, commodity_group_id) is None:
+def _validate_commodity_group(
+    db: Session, commodity_group_id: int, organization_id: uuid.UUID
+) -> None:
+    # Shared groups or the organization's own; another tenant's group is "unknown".
+    if get_visible_group(db, commodity_group_id, organization_id) is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Unknown commodity group id: {commodity_group_id}",
@@ -89,6 +93,45 @@ def _enforce_required_fields(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Missing fields required by your organization: {', '.join(missing)}",
+        )
+
+
+def _auto_approve_below(db: Session, organization_id: uuid.UUID) -> float | None:
+    org = db.get(Organization, organization_id)
+    return OrganizationSettings(**(org.settings or {})).auto_approve_below if org else None
+
+
+def _apply_auto_approval(
+    db: Session, request: ProcurementRequest, actor_id: uuid.UUID, limit: float | None
+) -> None:
+    """Approve requests below the organization's limit without a buyer.
+
+    Compared against the full total (incl. tax and shipping). On edits, an
+    auto-approved request that reaches the limit goes back to pending, and a
+    pending one that drops below it is approved. Decisions a buyer made
+    (approved/rejected by someone) are left alone.
+    """
+    if limit is None:
+        return
+    total = float(request.total_cost or 0)
+    auto_approved = request.approval_status == "approved" and request.approved_by is None
+    if request.approval_status == "pending" and total < limit:
+        request.approval_status = "approved"
+        request.approved_at = datetime.now(timezone.utc)
+        _log_activity(
+            db, request.id, actor_id, "auto_approved",
+            f"Approved automatically: total ${total:,.2f} is below the "
+            f"${limit:,.0f} approval limit",
+            {"total": total, "limit": limit},
+        )
+    elif auto_approved and total >= limit:
+        request.approval_status = "pending"
+        request.approved_at = None
+        _log_activity(
+            db, request.id, actor_id, "approval_required",
+            f"Needs approval again: total ${total:,.2f} is no longer below the "
+            f"${limit:,.0f} approval limit",
+            {"total": total, "limit": limit},
         )
 
 
@@ -181,7 +224,7 @@ def create_request(
     membership: OrganizationMember = Depends(get_current_membership),
     db: Session = Depends(get_db),
 ) -> RequestOut:
-    _validate_commodity_group(db, payload.commodity_group_id)
+    _validate_commodity_group(db, payload.commodity_group_id, membership.organization_id)
     _enforce_required_fields(db, membership.organization_id, payload)
 
     # Vendor fields are already cleaned up during extraction, so we can persist
@@ -210,9 +253,40 @@ def create_request(
         )
         for index, line in enumerate(payload.order_lines)
     ]
+    alternatives = snapshot_alternatives(
+        db, membership.organization_id, payload.order_lines, payload.catalog_alternatives or []
+    )
+    request.catalog_alternatives = alternatives or None
     db.add(request)
     db.flush()
     _log_activity(db, request.id, membership.user_id, "created", "Request created")
+    _apply_auto_approval(
+        db, request, membership.user_id, _auto_approve_below(db, membership.organization_id)
+    )
+    suggested_id = payload.suggested_commodity_group_id
+    if suggested_id is not None and suggested_id != payload.commodity_group_id:
+        suggested = get_visible_group(db, suggested_id, membership.organization_id)
+        chosen = get_visible_group(db, payload.commodity_group_id, membership.organization_id)
+        if suggested is not None and chosen is not None:
+            _log_activity(
+                db,
+                request.id,
+                membership.user_id,
+                "commodity_group_corrected",
+                f"Commodity group changed from the suggested {suggested.name} to {chosen.name}",
+                {"suggested_id": suggested.id, "chosen_id": chosen.id},
+            )
+    if alternatives:
+        count = len(alternatives)
+        _log_activity(
+            db,
+            request.id,
+            membership.user_id,
+            "catalog_alternatives",
+            f"Negotiated catalog alternatives were available for {count} "
+            f"line{'s' if count > 1 else ''}",
+            {"lines": [a["line_description"] for a in alternatives]},
+        )
     db.commit()
 
     request = _get_org_request(db, request.id, membership.organization_id)
@@ -227,7 +301,7 @@ def update_request(
     db: Session = Depends(get_db),
 ) -> RequestOut:
     request = _get_org_request(db, request_id, membership.organization_id)
-    _validate_commodity_group(db, payload.commodity_group_id)
+    _validate_commodity_group(db, payload.commodity_group_id, membership.organization_id)
     _enforce_required_fields(db, membership.organization_id, payload)
 
     changed = _changed_fields(request, payload)
@@ -262,6 +336,10 @@ def update_request(
             "updated",
             f"Updated {', '.join(labels)}",
             {"changed_fields": changed},
+        )
+    if "total_cost" in changed:
+        _apply_auto_approval(
+            db, request, membership.user_id, _auto_approve_below(db, membership.organization_id)
         )
     db.commit()
 
@@ -350,17 +428,7 @@ async def upload_document(
 ) -> None:
     """Attach (or replace) the original PDF for a request."""
     request = _get_org_request(db, request_id, membership.organization_id)
-
-    if file.content_type not in ("application/pdf", "application/x-pdf"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a PDF file"
-        )
-    content = await file.read()
-    if len(content) > MAX_PDF_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail="PDF exceeds the 10MB limit",
-        )
+    content = await read_pdf_upload(file)
 
     document = db.scalar(
         select(RequestDocument).where(RequestDocument.request_id == request.id)

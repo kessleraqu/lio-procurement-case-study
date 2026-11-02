@@ -45,8 +45,28 @@ export interface MyOrganization {
 // Request fields an org may optionally mark as required (see backend settings).
 export type ConfigurableRequiredField = 'vat_id' | 'department';
 
+// A booking rule: purchases of `applies_to` are booked under that group,
+// up to `max_total` (null = always).
+export interface CommodityRule {
+  applies_to: string;
+  commodity_group_id: number;
+  max_total: number | null;
+}
+
 export interface OrganizationSettings {
   required_fields: ConfigurableRequiredField[];
+  commodity_rules?: CommodityRule[];
+  // Show "AI suggested X, users chose Y" once it happened this many times.
+  correction_alert_threshold?: number;
+  // Requests whose full total is below this need no approval; null = all do.
+  auto_approve_below?: number | null;
+}
+
+export interface CorrectionPattern {
+  suggested: { id: number; category: string; name: string };
+  chosen: { id: number; category: string; name: string };
+  count: number;
+  examples: string[];
 }
 
 export interface MembersResponse {
@@ -71,6 +91,10 @@ export interface CreateRequestInput {
   totalCost: number;
   department: string;
   orderLines: OrderLineInput[];
+  // Catalog articles the form suggested per line, so the approver sees them.
+  catalogAlternatives?: { lineIndex: number; articleIds: string[] }[];
+  // The AI's suggested group; a different choice is logged as a correction.
+  suggestedCommodityGroupId?: number | null;
 }
 
 export interface UpdateRequestInput {
@@ -84,15 +108,28 @@ export interface UpdateRequestInput {
   orderLines: OrderLineInput[];
 }
 
+export interface ExtractedOrderLine extends OrderLineInput {
+  // Discount (negative) or surcharge (positive) printed on the line, in percent.
+  priceAdjustmentPercent: number | null;
+}
+
+// null = not found in the document (listed in ExtractionResponse.missingFields).
 export interface ExtractedVendorData {
-  title: string;
-  vendorName: string;
-  vatId: string;
-  department: string;
-  orderLines: OrderLineInput[];
-  totalCost: number;
+  title: string | null;
+  vendorName: string | null;
+  vatId: string | null;
+  department: string | null;
+  orderLines: ExtractedOrderLine[];
+  // The quote's grand total, as printed.
+  totalCost: number | null;
+  // Shipping, fees and tax outside the order lines: lines + this = totalCost.
+  additionalCharges: number;
+  // Options the vendor offers instead of ordered lines; not part of totalCost.
+  alternatives: ExtractedOrderLine[];
   commodityGroupId: number | null;
   commodityGroupName: string | null;
+  // The organization's booking rule that set the group (e.g. "printer toner").
+  commodityRule: string | null;
 }
 
 export interface ExtractionResponse {
@@ -100,6 +137,14 @@ export interface ExtractionResponse {
   data?: ExtractedVendorData;
   error?: string;
   missingFields?: string[];
+  // Inconsistencies the extraction couldn't resolve (e.g. totals don't add up).
+  warnings?: ExtractionWarning[] | null;
+}
+
+export interface ExtractionWarning {
+  // e.g. 'lines_vs_subtotal', 'line_math', 'vendor_is_customer'
+  code: string;
+  message: string;
 }
 
 export interface Supplier {
@@ -252,6 +297,10 @@ export const organizations = {
     return apiFetch(`/organizations/me/invites/${inviteId}`, { method: 'DELETE' });
   },
 
+  getCommodityCorrections(): Promise<CorrectionPattern[]> {
+    return apiFetch('/organizations/me/commodity-corrections');
+  },
+
   acceptInvite(token: string): Promise<MyOrganization> {
     return apiFetch('/organizations/invites/accept', { body: { token } });
   },
@@ -260,7 +309,8 @@ export const organizations = {
     return apiFetch('/organizations/me/settings');
   },
 
-  updateSettings(settings: OrganizationSettings): Promise<OrganizationSettings> {
+  // Only the settings sent are changed (the backend merges).
+  updateSettings(settings: Partial<OrganizationSettings>): Promise<OrganizationSettings> {
     return apiFetch('/organizations/me/settings', { method: 'PATCH', body: settings });
   },
 };
@@ -270,8 +320,22 @@ export const organizations = {
 // ============================================================================
 
 export const commodityGroups = {
+  // Shared groups plus your organization's own.
   list(): Promise<CommodityGroup[]> {
     return apiFetch('/commodity-groups');
+  },
+
+  // Your organization's own groups (admins only).
+  create(group: { category: string; name: string }): Promise<CommodityGroup> {
+    return apiFetch('/commodity-groups', { body: group });
+  },
+
+  update(id: number, group: { category: string; name: string }): Promise<CommodityGroup> {
+    return apiFetch(`/commodity-groups/${id}`, { method: 'PUT', body: group });
+  },
+
+  remove(id: number): Promise<void> {
+    return apiFetch(`/commodity-groups/${id}`, { method: 'DELETE' });
   },
 };
 
@@ -315,7 +379,36 @@ export const articles = {
   count(): Promise<{ count: number }> {
     return apiFetch('/articles/count');
   },
+
+  // Negotiated catalog articles matching each line (one list per line, in order).
+  suggest(
+    lines: { description: string; unitPrice?: number; amount?: number; unit?: string }[],
+    vendor?: { vendorName?: string; vendorTaxId?: string }
+  ): Promise<{ suggestions: ArticleSuggestion[][] }> {
+    return apiFetch('/articles/suggestions', { body: { lines, ...vendor } });
+  },
 };
+
+export interface ArticleSuggestion {
+  article_id: string;
+  article_number: string;
+  description: string;
+  supplier_name: string;
+  unit_price: number;
+  unit: string;
+  quantity: number;
+  // The model's view; the requester always reviews equivalence.
+  match: 'same' | 'comparable';
+  // Covers the same as the line, or a 'different' scope (e.g. panel + logo for
+  // a logo-only line). Prices are only directly comparable for 'same'.
+  scope: 'same' | 'different';
+  // Negotiated with the request's own vendor (the quote should use this price).
+  same_vendor: boolean;
+  // Priced in the same unit as the line, so the prices can be compared.
+  same_unit: boolean;
+  // The kind of product the line was read as (why it matched), e.g. "laptop".
+  matched_as: string;
+}
 
 // ============================================================================
 // PDF + extraction
