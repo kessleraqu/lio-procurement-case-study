@@ -63,6 +63,10 @@ class ArticleSuggestion(BaseModel):
     # brand/spec). Used to drop substitutes when the exact product exists; the
     # requester is always asked to review, since the model can be wrong.
     match: Literal["same", "comparable"]
+    # Whether the article covers the same as the line or a "different" scope
+    # (e.g. a complete panel with logo for a logo-only line) — prices are only
+    # directly comparable for "same".
+    scope: Literal["same", "different"] = "same"
     # The article is negotiated with the request's own vendor (the main case:
     # the quote should use this price), not with another supplier.
     same_vendor: bool = False

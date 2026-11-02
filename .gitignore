@@ -46,3 +46,4 @@ backend/tests/test_extraction_scenarios.py
 backend/tests/test_extraction_live.py
 backend/tests/fixtures/
 backend/scripts/eval_extraction.py
+backend/scripts/eval_matching.py

@@ -399,6 +399,9 @@ export interface ArticleSuggestion {
   quantity: number;
   // The model's view; the requester always reviews equivalence.
   match: 'same' | 'comparable';
+  // Covers the same as the line, or a 'different' scope (e.g. panel + logo for
+  // a logo-only line). Prices are only directly comparable for 'same'.
+  scope: 'same' | 'different';
   // Negotiated with the request's own vendor (the quote should use this price).
   same_vendor: boolean;
   // Priced in the same unit as the line, so the prices can be compared.

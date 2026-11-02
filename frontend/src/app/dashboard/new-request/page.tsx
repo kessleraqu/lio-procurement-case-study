@@ -675,8 +675,15 @@ export default function NewRequestPage() {
                       </p>
                       <ul className="divide-y divide-emerald-100 bg-white">
                         {line.suggestions.map((s) => {
-                          const difference = s.unit_price - line.unitPrice;
-                          const comparable = s.same_unit && line.unitPrice > 0;
+                          // Compare with what is actually paid per unit, after the line's discount.
+                          const effectivePrice = line.unitPrice * (1 + (line.priceAdjustmentPercent ?? 0) / 100);
+                          const difference = s.unit_price - effectivePrice;
+                          // A signed, coloured difference only for an identical product;
+                          // anything else gets the quote's price as neutral context.
+                          const identical =
+                            s.match === 'same' && s.same_unit && s.scope === 'same' &&
+                            line.unitPrice > 0;
+                          const comparable = identical;
                           return (
                             <li
                               key={s.article_id}
@@ -711,6 +718,16 @@ export default function NewRequestPage() {
                                     {difference < 0 ? '−' : '+'}
                                     {formatMoney(Math.abs(difference))} vs quote
                                   </span>
+                                )}
+                                {!identical && s.same_unit && s.scope === 'same' && line.unitPrice > 0 && (
+                                  <p className="text-xs text-gray-500">
+                                    {formatMoney(effectivePrice)} on this quote
+                                  </p>
+                                )}
+                                {s.scope !== 'same' && (
+                                  <p className="text-xs text-gray-500 max-w-[14rem]">
+                                    Not directly comparable — covers a different scope
+                                  </p>
                                 )}
                               </div>
                             </li>
