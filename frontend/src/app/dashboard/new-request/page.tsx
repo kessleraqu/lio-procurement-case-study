@@ -93,12 +93,17 @@ export default function NewRequestPage() {
         setCommodityGroupId(extracted.commodityGroupId);
       }
 
-      // Show warnings for missing fields
+      // Show warnings for missing fields and for numbers that don't add up
+      const warnings: string[] = [];
       if (extractionResult.missingFields && extractionResult.missingFields.length > 0) {
-        setWarning(
+        warnings.push(
           `⚠️ Could not extract: ${extractionResult.missingFields.join(', ')}. Please fill in these fields manually.`
         );
       }
+      for (const issue of extractionResult.warnings ?? []) {
+        warnings.push(`⚠️ Please double-check: ${issue}`);
+      }
+      setWarning(warnings.join('\n'));
 
       setSuccess('✓ PDF extracted successfully! Review and submit.');
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -214,7 +219,7 @@ export default function NewRequestPage() {
       </div>
 
       {error && <Alert variant="error" className="mb-6">{error}</Alert>}
-      {warning && <Alert variant="warning" className="mb-6">{warning}</Alert>}
+      {warning && <Alert variant="warning" className="mb-6 whitespace-pre-line">{warning}</Alert>}
       {success && <Alert variant="success" className="mb-6">{success}</Alert>}
 
       <form onSubmit={handleSubmit} className="space-y-8">

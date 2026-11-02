@@ -1,5 +1,4 @@
 import logging
-from typing import Literal
 
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -9,6 +8,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models import CommodityGroup
 from app.schemas.extraction import ExtractedVendorData, ExtractionResponse, OrderLineData
+from app.services.quote_checks import Issue, find_issues, normalize_tax_id
+from app.services.quote_model import Quote
 
 logger = logging.getLogger(__name__)
 
@@ -20,71 +21,6 @@ EXTRACTION_FAILED_MESSAGE = (
 # Software — Cloud"). Classifying against the ~380 base groups keeps the prompt
 # small (~4k instead of ~27k tokens) without losing any distinct category.
 _VARIANT_SEPARATOR = " — "
-
-
-# What the model must return, enforced by OpenAI structured outputs. Kept apart
-# from the API schema (ExtractedVendorData): strict mode forbids defaults, and
-# anything the document may not contain has to be nullable so a missing value
-# is reported instead of failing the whole extraction. Fields are generated in
-# order, so the customer and the evidence come before the vendor they rule out.
-LineType = Literal["item", "shipping", "fee", "discount", "tax", "alternative", "header"]
-
-# Line types that belong on the request; the rest are read but dropped.
-_ORDERED_LINE_TYPES = {"item", "shipping", "fee", "discount"}
-
-
-class _QuoteLine(BaseModel):
-    line_type: LineType = Field(
-        description=(
-            "item = a product/service being bought; shipping/fee = a priced row for "
-            "delivery or a fee; discount = a separate negative row; tax = a tax row; "
-            "alternative = an optional/alternative offer not included in the quote's "
-            "total; header = a section heading, subtotal or title row"
-        )
-    )
-    position_description: str
-    amount: float | None = Field(description="The Qty column value")
-    unit: str | None
-    unit_price: float | None = Field(description="Unit price as printed, before any discount")
-    total_price: float | None = Field(
-        description="The line total as printed (after any line discount)"
-    )
-
-
-class _Totals(BaseModel):
-    items_subtotal: float | None = Field(description="Net total of the items, before shipping/tax")
-    shipping: float | None = Field(description="Shipping/freight charged in the totals block")
-    tax: float | None = Field(description="All sales tax combined")
-    grand_total: float | None = Field(
-        description="The final amount payable, including shipping, tax and fees"
-    )
-
-
-class _Quote(BaseModel):
-    title: str | None
-    customer_name: str | None = Field(
-        description="Company the quote is addressed to ('Prepared for', 'Bill to', recipient)"
-    )
-    vendor_evidence: str = Field(
-        description=(
-            "Copy the text that names the company that ISSUED the quote: the sender line, "
-            "'Prepared by' block, signature or footer with its bank details / EIN"
-        )
-    )
-    vendor_name: str | None = Field(
-        description="Legal name of the issuing company, taken from the evidence; never the customer"
-    )
-    vat_id: str | None = Field(
-        description="The VENDOR's tax ID (EIN/TIN/Tax ID) as printed; null if the document has none"
-    )
-    department: str | None = Field(
-        description=(
-            "A team/department of the customer named on the quote (e.g. 'Attn: Purchasing'); "
-            "null if none — never a company or a person's name"
-        )
-    )
-    order_lines: list[_QuoteLine]
-    totals: _Totals
 
 
 class _Classification(BaseModel):
@@ -125,6 +61,7 @@ LINE ITEMS
 
 TOTALS
 - grand_total is the final amount payable on the LAST page (often "Grand total", "Total (gross)", "Total (USD)"). "Carried forward" and "Page subtotal" are not totals.
+- tax is the sum of ALL tax rows; quotes often tax items and shipping on separate rows.
 
 TITLE
 - A SHORT (2-5 words) description of the main items being purchased.
@@ -133,7 +70,7 @@ Document Text:
 {pdf_text}"""
 
 
-def _build_classification_prompt(quote: _Quote, groups_list: str) -> str:
+def _build_classification_prompt(quote: Quote, groups_list: str) -> str:
     lines = "\n".join(
         f"- {line.position_description}"
         for line in quote.order_lines
@@ -158,7 +95,7 @@ Available Commodity Groups (ID | Category | Name):
 
 
 def _classify(
-    client: OpenAI, quote: _Quote, groups: list[CommodityGroup]
+    client: OpenAI, quote: Quote, groups: list[CommodityGroup]
 ) -> CommodityGroup | None:
     """Pick the commodity group in a second, small call. Failure is non-fatal."""
     base_groups = [g for g in groups if _VARIANT_SEPARATOR not in g.name]
@@ -196,11 +133,11 @@ def _classify(
     return group
 
 
-def _to_api_data(quote: _Quote, group: CommodityGroup | None) -> ExtractedVendorData:
+def _to_api_data(quote: Quote, group: CommodityGroup | None) -> ExtractedVendorData:
     return ExtractedVendorData(
         title=quote.title,
         vendor_name=quote.vendor_name,
-        vat_id=quote.vat_id,
+        vat_id=normalize_tax_id(quote.vat_id),
         department=quote.department,
         order_lines=[
             OrderLineData(
@@ -210,9 +147,8 @@ def _to_api_data(quote: _Quote, group: CommodityGroup | None) -> ExtractedVendor
                 unit=line.unit or "",
                 total_price=line.total_price or 0,
             )
-            for line in quote.order_lines
             # Alternatives, section headers and tax rows aren't part of the order.
-            if line.line_type in _ORDERED_LINE_TYPES
+            for line in quote.ordered_lines
         ],
         total_cost=quote.totals.grand_total,
         commodity_group_id=group.id if group else None,
@@ -220,14 +156,68 @@ def _to_api_data(quote: _Quote, group: CommodityGroup | None) -> ExtractedVendor
     )
 
 
+def _read_quote(client: OpenAI, messages: list[dict]) -> tuple[Quote | None, str | None]:
+    """One structured-output extraction call. Returns (quote, raw JSON reply)."""
+    response = client.chat.completions.parse(
+        model=settings.openai_model,
+        messages=messages,
+        response_format=Quote,
+        max_completion_tokens=4000,
+        temperature=0.3,
+    )
+    message = response.choices[0].message
+    if message.parsed is None:
+        logger.warning("Extraction returned no data (refusal: %s)", message.refusal)
+    return message.parsed, message.content
+
+
+def _extract_with_checks(client: OpenAI, pdf_text: str) -> tuple[Quote | None, list[Issue]]:
+    """Extract, check the arithmetic, and give the model one chance to fix what doesn't add up.
+
+    Returns the more consistent of the two readings and its remaining issues.
+    """
+    messages = [
+        {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+        {"role": "user", "content": _build_extraction_prompt(pdf_text)},
+    ]
+    quote, raw = _read_quote(client, messages)
+    if quote is None:
+        return None, []
+    issues = find_issues(quote)
+    if not issues:
+        return quote, []
+
+    logger.info("Extraction inconsistent, retrying once: %s", [i.message for i in issues])
+    feedback = (
+        "Your extraction is inconsistent with the document:\n"
+        + "\n".join(f"- {issue.message}" for issue in issues)
+        + "\nRe-read the document and return the corrected extraction. If the document "
+        "itself prints these numbers, keep them as printed."
+    )
+    try:
+        retry, _ = _read_quote(
+            client,
+            [*messages, {"role": "assistant", "content": raw}, {"role": "user", "content": feedback}],
+        )
+    except Exception:  # noqa: BLE001 — keep the first reading if the retry fails
+        logger.exception("Extraction retry failed")
+        return quote, issues
+    if retry is None:
+        return quote, issues
+    retry_issues = find_issues(retry)
+    return (retry, retry_issues) if len(retry_issues) <= len(issues) else (quote, issues)
+
+
 def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
     """Extract vendor data from a quote, then classify its commodity group.
 
-    Two structured-output calls: extraction sees only the document, so the
-    quote isn't buried under the commodity taxonomy; classification sees only
-    the extracted purchase and the base commodity groups. Values the document
-    lacks come back as null and are listed in ``missing_fields`` rather than
-    failing the extraction.
+    Extraction sees only the document, so the quote isn't buried under the
+    commodity taxonomy; its result is checked for internal consistency (line
+    and grand totals add up, vendor isn't the customer) and retried once with
+    the problems spelled out. Classification is a second, small call over the
+    extracted purchase and the base commodity groups. Values the document lacks
+    come back as null and are listed in ``missing_fields``; inconsistencies that
+    survive the retry are returned as ``warnings`` for the user to check.
     """
     if not pdf_text or not pdf_text.strip():
         return ExtractionResponse(success=False, error="No text provided for extraction")
@@ -249,25 +239,13 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
 
     client = OpenAI(api_key=settings.openai_api_key)
     try:
-        response = client.chat.completions.parse(
-            model=settings.openai_model,
-            messages=[
-                {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": _build_extraction_prompt(pdf_text)},
-            ],
-            response_format=_Quote,
-            max_completion_tokens=4000,
-            temperature=0.3,
-        )
-        message = response.choices[0].message
-        if message.parsed is None:
-            logger.warning("Extraction returned no data (refusal: %s)", message.refusal)
-            return ExtractionResponse(success=False, error=EXTRACTION_FAILED_MESSAGE)
+        quote, issues = _extract_with_checks(client, pdf_text)
     except Exception:  # noqa: BLE001 — API/network errors surface as a clean envelope
         logger.exception("Error extracting vendor data")
         return ExtractionResponse(success=False, error=EXTRACTION_FAILED_MESSAGE)
+    if quote is None:
+        return ExtractionResponse(success=False, error=EXTRACTION_FAILED_MESSAGE)
 
-    quote = message.parsed
     extracted = _to_api_data(quote, _classify(client, quote, commodity_groups))
 
     # Report what the document didn't give us so the UI can ask for it.
@@ -291,4 +269,5 @@ def extract_vendor_data(pdf_text: str, db: Session) -> ExtractionResponse:
         success=True,
         data=extracted,
         missing_fields=missing_fields or None,
+        warnings=[i.message for i in issues if i.affects_request] or None,
     )

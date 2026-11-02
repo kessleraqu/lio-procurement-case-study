@@ -101,6 +101,8 @@ export interface ExtractionResponse {
   data?: ExtractedVendorData;
   error?: string;
   missingFields?: string[];
+  // Inconsistencies the extraction couldn't resolve (e.g. totals don't add up).
+  warnings?: string[] | null;
 }
 
 export interface Supplier {

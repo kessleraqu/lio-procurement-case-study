@@ -42,3 +42,6 @@ class ExtractionResponse(BaseModel):
     data: ExtractedVendorData | None = None
     error: str | None = None
     missing_fields: list[str] | None = Field(default=None, alias="missingFields")
+    # Inconsistencies that survived the retry (e.g. totals that don't add up),
+    # for the user to double-check before submitting.
+    warnings: list[str] | None = None
