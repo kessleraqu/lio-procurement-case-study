@@ -47,6 +47,9 @@ _UNIT_ALIASES = {
 
 # Products are referenced by name, not by number: with numbered lists the model
 # falls back to product 0 when nothing fits. An unknown name is simply dropped.
+_UNKNOWN_KINDS = {"", "unknown", "none", "n/a", "unclear"}
+
+
 class _ProductMatch(BaseModel):
     product_name: str
     match: Literal["same", "comparable"]
@@ -89,6 +92,7 @@ Rules:
 - "same" = an identical product: the same manufacturer/model, or a generic commodity with an identical specification (e.g. "black toner, high yield"). Custom-made, branded or vendor-specific products from another maker are "comparable" at most. "comparable" = same kind of product, different brand or specification (e.g. a business laptop for a specific laptop model).
 - Prefer the closest specification (size, resolution, capacity, color).
 - If the catalog has nothing of that kind, return no matches for the line — that is the normal case.
+- Judge each line on its own. Brand names, model numbers and vendor codes in a description are normal — name the kind from the rest of it (e.g. "Contoso PRO-X 2400 series, 27 in IPS" is a monitor). Only a line that gives no clue at all what is being bought (e.g. "test", "xxx", "item 1") gets the kind "unknown" and no matches.
 - At most {MAX_PRODUCTS_PER_LINE} products per line. Copy product names exactly as listed.
 
 Requested lines:
@@ -160,6 +164,9 @@ def suggest_articles(
     for line_matches in matches.lines:
         if not 0 <= line_matches.line < len(lines):
             continue  # ignore unknown lines
+        kind = line_matches.product_kind.strip()
+        if kind.lower() in _UNKNOWN_KINDS:
+            continue  # the model couldn't tell what the line is: suggest nothing
         known = [m for m in line_matches.matches[:MAX_PRODUCTS_PER_LINE]
                  if m.product_name in offered]
         # If the exact product is negotiated, substitutes are just noise.
@@ -167,7 +174,7 @@ def suggest_articles(
             known = [m for m in known if m.match == "same"]
         for m in known:
             _add_options(suggestions[line_matches.line], lines[line_matches.line],
-                         by_product[m.product_name], m.match, vendor_name, vendor_tax_id)
+                         by_product[m.product_name], m.match, kind, vendor_name, vendor_tax_id)
     for options in suggestions:
         options.sort(key=lambda s: not s.same_vendor)  # stable: keeps cheapest-first
     return suggestions
@@ -192,6 +199,7 @@ def _add_options(
     line: SuggestionLineIn,
     articles: list[Article],
     match: str,
+    kind: str,
     vendor_name: str | None,
     vendor_tax_id: str | None,
 ) -> None:
@@ -212,6 +220,7 @@ def _add_options(
                 match=match,
                 same_vendor=article in own,
                 same_unit=_unit_key(line.unit) == _unit_key(article.unit),
+                matched_as=kind,
             )
         )
 

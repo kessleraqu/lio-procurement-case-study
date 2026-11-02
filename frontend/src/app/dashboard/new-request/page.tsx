@@ -17,6 +17,8 @@ interface OrderLine {
   priceAdjustmentPercent?: number | null;
   // Negotiated catalog articles for this line (shown, never applied automatically).
   suggestions?: api.ArticleSuggestion[];
+  // The catalog was checked for this line's current description.
+  catalogChecked?: boolean;
 }
 
 // Rounding slack when comparing money amounts.
@@ -63,9 +65,11 @@ export default function NewRequestPage() {
   const [alternatives, setAlternatives] = useState<OrderLine[]>([]);
 
   const [checkingCatalog, setCheckingCatalog] = useState(false);
+  const [catalogCheckFailed, setCatalogCheckFailed] = useState(false);
 
-  // Look up negotiated catalog prices for the given lines. Suggestions are
-  // optional: a failure never blocks the request.
+  // Look up negotiated catalog prices for the given lines. Every line must be
+  // checked before the request can be created; if the check itself fails, the
+  // lines count as checked so the request is never blocked by an outage.
   const checkCatalog = async (
     lines: OrderLine[],
     vendor: { vendorName?: string; vendorTaxId?: string }
@@ -73,6 +77,8 @@ export default function NewRequestPage() {
     const withText = lines.filter((line) => line.positionDescription.trim());
     if (withText.length === 0) return;
     setCheckingCatalog(true);
+    setCatalogCheckFailed(false);
+    let results: api.ArticleSuggestion[][] = withText.map(() => []);
     try {
       const { suggestions } = await api.articles.suggest(
         withText.map(({ positionDescription, unitPrice, amount, unit }) => ({
@@ -80,13 +86,20 @@ export default function NewRequestPage() {
         })),
         vendor
       );
-      const byLine = new Map(withText.map((line, i) => [line, suggestions[i] ?? []]));
-      setOrderLines((current) =>
-        current.map((line) => (byLine.has(line) ? { ...line, suggestions: byLine.get(line) } : line))
-      );
+      results = withText.map((_, i) => suggestions[i] ?? []);
     } catch (err) {
       console.error('Catalog check failed:', err);
+      setCatalogCheckFailed(true);
     } finally {
+      // Lines edited meanwhile are new objects, so they stay unchecked.
+      const byLine = new Map(withText.map((line, i) => [line, results[i]]));
+      setOrderLines((current) =>
+        current.map((line) =>
+          byLine.has(line)
+            ? { ...line, suggestions: byLine.get(line), catalogChecked: true }
+            : line
+        )
+      );
       setCheckingCatalog(false);
     }
   };
@@ -95,6 +108,12 @@ export default function NewRequestPage() {
     queryKey: ['organization-settings'],
     queryFn: () => api.organizations.getSettings(),
   });
+
+  // Lines whose description hasn't been checked against the catalog yet.
+  const uncheckedLines = orderLines.filter(
+    (line) => line.positionDescription.trim() && !line.catalogChecked
+  );
+  const catalogPending = checkingCatalog || uncheckedLines.length > 0;
 
   const totalCost =
     Math.round(
@@ -120,6 +139,8 @@ export default function NewRequestPage() {
   const [success, setSuccess] = useState('');
   const [warning, setWarning] = useState('');
   const [extracting, setExtracting] = useState(false);
+  // Nothing can be submitted while the PDF is read or the catalog checked.
+  const submitBlocked = extracting || catalogPending;
 
   // PDF parsing mutation
   const parsePDFMutation = useMutation({
@@ -234,7 +255,9 @@ export default function NewRequestPage() {
     const updated = [...orderLines];
     updated[index] = { ...updated[index], [field]: value };
     if (field === 'positionDescription') {
-      updated[index].suggestions = undefined; // no longer about this item
+      // A new description is a new item: check the catalog again.
+      updated[index].suggestions = undefined;
+      updated[index].catalogChecked = false;
     }
     
     // Auto-calculate total price (keeping the quote's discount/surcharge)
@@ -270,6 +293,16 @@ export default function NewRequestPage() {
     if (!commodityGroupId) {
       setError('Please select a commodity group');
       window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+
+    if (extracting) {
+      setError('Please wait until the PDF has been read');
+      return;
+    }
+
+    if (catalogPending) {
+      setError('Please check negotiated prices for all order lines first');
       return;
     }
 
@@ -484,15 +517,19 @@ export default function NewRequestPage() {
           <div className="flex items-center justify-between mb-4">
             <h2 className="text-xl font-semibold tracking-tight text-ink">Order Lines *</h2>
             <div className="flex gap-2">
-              <Button
-                type="button"
-                onClick={() => checkCatalog(orderLines, { vendorName, vendorTaxId: vatId })}
-                variant="outline"
-                size="sm"
-                disabled={checkingCatalog || orderLines.length === 0}
-              >
-                {checkingCatalog ? 'Checking catalog…' : 'Check negotiated prices'}
-              </Button>
+              {catalogPending && (
+                // Only offered when there is something new to check.
+                <Button
+                  type="button"
+                  onClick={() => checkCatalog(uncheckedLines, { vendorName, vendorTaxId: vatId })}
+                  size="sm"
+                  loading={checkingCatalog}
+                >
+                  {checkingCatalog
+                    ? 'Checking catalog…'
+                    : `Check negotiated prices (${uncheckedLines.length})`}
+                </Button>
+              )}
               <Button type="button" onClick={addOrderLine} variant="outline" size="sm">
                 + Add Line
               </Button>
@@ -515,7 +552,23 @@ export default function NewRequestPage() {
                   }`}
                 >
                   <div className="flex items-start justify-between mb-4">
-                    <h3 className="text-sm font-medium text-gray-700">Line {index + 1}</h3>
+                    <h3 className="text-sm font-medium text-gray-700 flex items-center gap-2">
+                      Line {index + 1}
+                      {line.positionDescription.trim() &&
+                        (line.catalogChecked ? (
+                          <span className="text-xs font-normal text-green-700">
+                            ✓ Catalog checked
+                          </span>
+                        ) : checkingCatalog ? (
+                          <span className="text-xs font-normal text-gray-500">
+                            Checking catalog…
+                          </span>
+                        ) : (
+                          <span className="text-xs font-normal text-amber-700">
+                            Catalog not checked yet
+                          </span>
+                        ))}
+                    </h3>
                     <button
                       type="button"
                       onClick={() => removeOrderLine(index)}
@@ -587,45 +640,64 @@ export default function NewRequestPage() {
                   </div>
 
                   {line.suggestions && line.suggestions.length > 0 && (
-                    <div className="mt-3 rounded-lg border border-accent/40 bg-accent-soft/20 p-3">
-                      <p className="text-sm font-medium text-ink">
-                        Similar products in your catalog (negotiated prices)
+                    <div className="mt-3 overflow-hidden rounded-lg border border-emerald-200 border-l-4 border-l-emerald-500 bg-emerald-50/60">
+                      <p
+                        className="px-3 py-2 text-sm text-emerald-900"
+                        title="To use a negotiated price, raise this request with that supplier as the vendor."
+                      >
+                        <span className="font-medium">Negotiated prices in your catalog</span>
+                        {line.suggestions[0].matched_as && (
+                          <span className="text-emerald-800/70">
+                            {' '}
+                            · matched as &ldquo;{line.suggestions[0].matched_as}&rdquo; · review
+                            before switching
+                          </span>
+                        )}
                       </p>
-                      <ul className="mt-1 space-y-1">
+                      <ul className="divide-y divide-emerald-100 bg-white">
                         {line.suggestions.map((s) => {
                           const difference = s.unit_price - line.unitPrice;
+                          const comparable = s.same_unit && line.unitPrice > 0;
                           return (
-                            <li key={s.article_id} className="text-sm text-gray-700">
-                              {s.same_vendor && (
-                                <span className="mr-2 rounded bg-green-100 px-1.5 py-0.5 text-xs font-medium text-green-800">
-                                  This vendor
-                                </span>
-                              )}
-                              <span className="font-medium">{s.supplier_name}</span> ·{' '}
-                              {s.description} ({s.article_number}) ·{' '}
-                              <span className="font-medium">
-                                {formatMoney(s.unit_price)}/{s.unit}
-                              </span>
-                              {s.same_unit && line.unitPrice > 0 && (
-                                <span className="text-gray-500">
-                                  {' '}
-                                  vs {formatMoney(line.unitPrice)} on this quote (
-                                  {difference < 0 ? '−' : '+'}
-                                  {formatMoney(Math.abs(difference))}/{s.unit})
-                                </span>
-                              )}
+                            <li
+                              key={s.article_id}
+                              className="px-3 py-2 flex items-center justify-between gap-4"
+                            >
+                              <div className="min-w-0">
+                                <p className="text-sm font-medium text-ink truncate">
+                                  {s.supplier_name}
+                                  {s.same_vendor && (
+                                    <span className="ml-2 rounded bg-green-100 px-1.5 py-0.5 text-xs font-medium text-green-800">
+                                      This vendor
+                                    </span>
+                                  )}
+                                </p>
+                                <p className="text-xs text-gray-500 truncate">
+                                  {s.description} · {s.article_number}
+                                </p>
+                              </div>
+                              <div className="text-right shrink-0">
+                                <p className="text-sm font-semibold text-ink">
+                                  {formatMoney(s.unit_price)}
+                                  <span className="font-normal text-gray-500">/{s.unit}</span>
+                                </p>
+                                {comparable && (
+                                  <span
+                                    className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
+                                      difference < 0
+                                        ? 'bg-emerald-100 text-emerald-800'
+                                        : 'bg-gray-100 text-gray-600'
+                                    }`}
+                                  >
+                                    {difference < 0 ? '−' : '+'}
+                                    {formatMoney(Math.abs(difference))} vs quote
+                                  </span>
+                                )}
+                              </div>
                             </li>
                           );
                         })}
                       </ul>
-                      <p className="mt-1 text-xs text-gray-500">
-                        Review before switching: check the product is equivalent. To use a
-                        negotiated price, raise this request with that supplier as the vendor
-                        {line.suggestions.some((s) => s.same_vendor)
-                          ? ', or ask this vendor to apply its agreed price'
-                          : ''}
-                        .
-                      </p>
                     </div>
                   )}
 
@@ -717,6 +789,19 @@ export default function NewRequestPage() {
 
         {/* Submit */}
         <div className="flex items-center justify-end space-x-4">
+          {extracting ? (
+            <span className="text-sm text-amber-700">Reading the PDF…</span>
+          ) : catalogPending ? (
+            <span className="text-sm text-amber-700">
+              {checkingCatalog
+                ? 'Checking negotiated prices…'
+                : 'Check negotiated prices for new or changed lines first'}
+            </span>
+          ) : catalogCheckFailed ? (
+            <span className="text-sm text-gray-500">
+              Couldn&apos;t reach the catalog — you can still create the request.
+            </span>
+          ) : null}
           <Button
             type="button"
             variant="outline"
@@ -724,7 +809,7 @@ export default function NewRequestPage() {
           >
             Cancel
           </Button>
-          <Button type="submit" size="lg">
+          <Button type="submit" size="lg" disabled={submitBlocked}>
             Create Request
           </Button>
         </div>

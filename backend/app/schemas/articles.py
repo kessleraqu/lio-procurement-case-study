@@ -68,6 +68,8 @@ class ArticleSuggestion(BaseModel):
     same_vendor: bool = False
     # Priced in the same unit as the line, so the two prices can be compared.
     same_unit: bool = False
+    # The kind of product the line was read as (why it matched), e.g. "laptop".
+    matched_as: str = ""
 
 class SuggestionResponse(BaseModel):
     # One list per input line, in order; empty = nothing in the catalog.

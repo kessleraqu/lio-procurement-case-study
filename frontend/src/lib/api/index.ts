@@ -360,6 +360,8 @@ export interface ArticleSuggestion {
   same_vendor: boolean;
   // Priced in the same unit as the line, so the prices can be compared.
   same_unit: boolean;
+  // The kind of product the line was read as (why it matched), e.g. "laptop".
+  matched_as: string;
 }
 
 // ============================================================================

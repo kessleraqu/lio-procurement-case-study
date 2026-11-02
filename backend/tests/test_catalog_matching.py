@@ -51,7 +51,7 @@ def _fake_openai(picks: dict[int, tuple[str, str]]):
 
     def parse(*, messages, response_format, **_):
         reply = {"lines": [
-            {"line": line, "product_kind": "x", "matches": [{"product_name": name, "match": match}]}
+            {"line": line, "product_kind": "toner", "matches": [{"product_name": name, "match": match}]}
             for line, (name, match) in picks.items()
         ]}
         message = SimpleNamespace(parsed=response_format.model_validate(reply))
@@ -172,3 +172,20 @@ def test_snapshot_uses_own_catalog_prices_and_ignores_foreign_or_bad_refs(db, ac
     assert entry["line_description"] == "Toner" and entry["quoted_unit_price"] == 210
     assert [o["article_number"] for o in entry["options"]] == [own.article_number]
     assert entry["options"][0]["unit_price"] == float(own.unit_price)
+
+
+def test_line_the_model_cannot_identify_gets_no_suggestions(db, acme):
+    def parse(*, response_format, **_):
+        reply = {"lines": [{"line": 0, "product_kind": "Unknown",
+                            "matches": [{"product_name": TONER, "match": "comparable"}]}]}
+        message = SimpleNamespace(parsed=response_format.model_validate(reply))
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(parse=parse)))
+    with patch("app.services.catalog_matching.OpenAI", lambda **_: client):
+        assert suggest_articles([SuggestionLineIn(description="test")], acme, db) == [[]]
+
+
+def test_suggestions_say_what_the_line_was_matched_as(db, acme):
+    [toner] = _suggest(db, acme, [{"description": "HP cyan"}], {0: (TONER, "same")})
+    assert toner and all(s.matched_as == "toner" for s in toner)
