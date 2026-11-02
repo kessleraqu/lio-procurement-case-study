@@ -9,7 +9,7 @@ with:
 import logging
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.security import hash_password
@@ -26,6 +26,7 @@ from app.models import (
     Supplier,
     User,
 )
+from app.services.commodity_groups import next_org_group_id
 
 logger = logging.getLogger(__name__)
 
@@ -164,9 +165,7 @@ def seed_organizations_and_accounts(db: Session) -> tuple[int, int]:
 
 
 # Acme's accounting quirks (case brief, complaint 3). "Office Supplies" is not in
-# the shared taxonomy, so it is created as an Acme-only group. Organization
-# groups get ids from 100000 up, clear of the shared taxonomy's fixed ids.
-ORG_GROUP_ID_START = 100_000
+# the shared taxonomy, so it is created as an Acme-only group.
 ACME_GROUPS = [("Office & Administration", "Office Supplies")]
 ACME_RULES = [  # (applies_to, group name, max_total)
     ("cable ties", "Electrical Engineering", None),
@@ -183,9 +182,7 @@ def seed_acme_accounting(db: Session, org: Organization) -> int:
         exists = db.scalar(select(CommodityGroup).where(
             CommodityGroup.organization_id == org.id, CommodityGroup.name == name))
         if exists is None:
-            next_id = max(db.scalar(select(func.max(CommodityGroup.id))) or 0,
-                          ORG_GROUP_ID_START - 1) + 1
-            db.add(CommodityGroup(id=next_id, category=category, name=name,
+            db.add(CommodityGroup(id=next_org_group_id(db), category=category, name=name,
                                   organization_id=org.id))
             db.flush()
             created += 1

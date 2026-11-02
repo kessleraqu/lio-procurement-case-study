@@ -507,7 +507,8 @@ def test_commodity_groups_expanded():
     # Large taxonomy.
     assert len(groups) >= 1000, f"expected a large taxonomy, got {len(groups)}"
     # ids contiguous from 1; first one matches the original taxonomy
-    assert groups[0] == {"id": 1, "category": "General Services", "name": "Accommodation Rentals"}
+    assert groups[0] == {"id": 1, "category": "General Services", "name": "Accommodation Rentals",
+                         "organization_id": None}
     assert len({g["category"] for g in groups}) >= 20
 
     # Every leaf name belongs to exactly one category.
@@ -928,3 +929,49 @@ def test_repeated_group_corrections_are_shown_to_admins():
     # Admins only.
     assert client.get("/organizations/me/commodity-corrections",
                       headers=_auth(requester)).status_code == 403
+
+
+def test_admins_manage_their_own_commodity_groups():
+    acme = client.post("/auth/signin", json={"email": "admin@acme.com",
+                                             "password": "demo1234"}).json()["access_token"]
+    walmart = client.post("/auth/signin", json={"email": "admin@walmart.com",
+                                                "password": "demo1234"}).json()["access_token"]
+    requester = client.post("/auth/signin", json={"email": "requester@acme.com",
+                                                  "password": "demo1234"}).json()["access_token"]
+    body = {"category": "Office & Administration", "name": "Desk Plants"}
+
+    assert client.post("/commodity-groups", json=body,
+                       headers=_auth(requester)).status_code == 403  # admins only
+    group = client.post("/commodity-groups", json=body, headers=_auth(acme)).json()
+    assert group["id"] >= 100_000 and group["organization_id"]  # own code range
+    assert client.post("/commodity-groups", json=body,
+                       headers=_auth(acme)).status_code == 409  # name taken
+    assert client.post("/commodity-groups", json={**body, "name": "Hardware"},
+                       headers=_auth(acme)).status_code == 409  # clashes with a shared one
+
+    names = lambda token: {g["name"] for g in  # noqa: E731
+                           client.get("/commodity-groups", headers=_auth(token)).json()}
+    assert "Desk Plants" in names(acme) and "Desk Plants" not in names(walmart)
+
+    # Rename keeps the code; other tenants and shared groups can't be changed.
+    renamed = client.put(f"/commodity-groups/{group['id']}", headers=_auth(acme),
+                         json={**body, "name": "Office Plants"}).json()
+    assert renamed["id"] == group["id"] and renamed["name"] == "Office Plants"
+    assert client.put(f"/commodity-groups/{group['id']}", json=body,
+                      headers=_auth(walmart)).status_code == 404
+    assert client.delete("/commodity-groups/29", headers=_auth(acme)).status_code == 404
+
+    # In use by a request -> can't delete; unused -> deleted.
+    payload = {
+        "requestorName": "A", "titleShortDescription": "Ficus", "vendorName": "V",
+        "commodityGroupId": group["id"], "totalCost": 40.0,
+        "orderLines": [{"positionDescription": "Ficus", "unitPrice": 40, "amount": 1,
+                        "unit": "piece", "totalPrice": 40}],
+    }
+    rid = client.post("/requests", json=payload, headers=_auth(acme)).json()["id"]
+    r = client.delete(f"/commodity-groups/{group['id']}", headers=_auth(acme))
+    assert r.status_code == 409 and "1 request" in r.json()["detail"]
+    client.delete(f"/requests/{rid}", headers=_auth(acme))
+    assert client.delete(f"/commodity-groups/{group['id']}",
+                         headers=_auth(acme)).status_code == 204
+    assert "Office Plants" not in names(acme)

@@ -318,8 +318,22 @@ export const organizations = {
 // ============================================================================
 
 export const commodityGroups = {
+  // Shared groups plus your organization's own.
   list(): Promise<CommodityGroup[]> {
     return apiFetch('/commodity-groups');
+  },
+
+  // Your organization's own groups (admins only).
+  create(group: { category: string; name: string }): Promise<CommodityGroup> {
+    return apiFetch('/commodity-groups', { body: group });
+  },
+
+  update(id: number, group: { category: string; name: string }): Promise<CommodityGroup> {
+    return apiFetch(`/commodity-groups/${id}`, { method: 'PUT', body: group });
+  },
+
+  remove(id: number): Promise<void> {
+    return apiFetch(`/commodity-groups/${id}`, { method: 'DELETE' });
   },
 };
 

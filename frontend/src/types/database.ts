@@ -42,7 +42,9 @@ export type CommodityGroup = {
   id: number;
   category: string;
   name: string;
-  created_at: string;
+  // Set for a group only your organization uses; null = shared taxonomy.
+  organization_id?: string | null;
+  created_at?: string;
 };
 
 export type ProcurementRequest = {

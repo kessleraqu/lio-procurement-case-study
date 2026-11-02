@@ -75,6 +75,13 @@ class CommodityGroupOut(BaseModel):
     id: int
     category: str
     name: str
+    # Set for a group only this organization uses; None = shared taxonomy.
+    organization_id: uuid.UUID | None = None
+
+
+class CommodityGroupIn(BaseModel):
+    category: str = Field(min_length=2, max_length=100)
+    name: str = Field(min_length=2, max_length=100)
 
 
 class OrderLineOut(BaseModel):
