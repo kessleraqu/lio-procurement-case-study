@@ -30,3 +30,17 @@ npm-debug.log*
 
 # Logs
 *.log
+# Case-study material (brief, quotes) — local reference only
+extra/
+
+# Claude Code local config / skills
+.claude/
+CLAUDE.local.md
+skills-lock.json
+
+# Local extraction test scenarios (quote fixtures, live evals, scorecard)
+backend/tests/quote_scenarios.py
+backend/tests/test_extraction_scenarios.py
+backend/tests/test_extraction_live.py
+backend/tests/fixtures/
+backend/scripts/eval_extraction.py

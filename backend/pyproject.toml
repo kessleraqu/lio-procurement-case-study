@@ -27,6 +27,11 @@ dev = [
 line-length = 100
 target-version = "py311"
 
+[tool.pytest.ini_options]
+# Live scenarios call OpenAI; run them explicitly with `python -m pytest -m live`.
+addopts = "-m 'not live'"
+markers = ["live: calls the real OpenAI API (needs OPENAI_API_KEY)"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
