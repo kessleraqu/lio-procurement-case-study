@@ -25,7 +25,16 @@ class QuoteLine(BaseModel):
             "total; header = a section heading, subtotal or title row"
         )
     )
-    position_description: str
+    position_description: str = Field(
+        description=(
+            "Product/service description. For alternatives, write a standalone description: "
+            "replace every reference to another item with that item's actual product or "
+            "feature, then retain the alternative's explicit changes. Never write 'as "
+            "previous item', 'item 1.1', 'as described above' or 'as described in the "
+            "original item'. Name inherited features directly, including lettering or "
+            "other components when mentioned. Preserve which specific component changes."
+        )
+    )
     amount: float | None = Field(description="The Qty column value")
     unit: str | None
     unit_price: float | None = Field(description="Unit price as printed, before any discount")

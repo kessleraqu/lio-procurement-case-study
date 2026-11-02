@@ -65,7 +65,19 @@ class _GroupChoice:
 EXTRACTION_SYSTEM_PROMPT = (
     "You extract structured data from vendor quotes (US business documents) for a "
     "procurement system. Read the whole document carefully; accuracy matters more than "
-    "completeness — return null rather than guessing."
+    "completeness — return null rather than guessing. "
+    "For alternative lines, position_description must be a standalone product/variant "
+    "description, not a verbatim transcription of cross-references. Replace references "
+    "to previous items or document item numbers with the referenced product and the "
+    "alternative's changes. Never leave 'as previous item', 'as above' or references "
+    "like 'item 1.1' in an alternative description. Use only document-supported details; "
+    "if the reference is unclear, describe only the explicitly stated variant. "
+    "Do not replace a numbered reference with another reference such as 'as described "
+    "in the original item': state the inherited feature directly or omit a redundant "
+    "reference. The reader must not need another item's text to understand the alternative. "
+    "Preserve exactly which component the alternative changes: a change to one part "
+    "must not be described as a change to the whole product. Retain the alternative's "
+    "explicit modifications in full rather than summarizing them; only resolve their references."
 )
 
 CLASSIFICATION_SYSTEM_PROMPT = (
@@ -87,11 +99,18 @@ WHO IS WHO
 LINE ITEMS
 - Return every row of the item table with a line_type.
 - Alternatives are not part of the order: a row marked "Alternative", "Alt." or "(Alt.)" anywhere in or under it, every row that follows a heading like "Alternative: …" or "Alternative to the preceding item", and rows priced only as a unit price ("U.P.") without a total are line_type "alternative".
+- Rewrite each alternative's position_description as a self-contained product description. Resolve all cross-references using the original item, even across pages, and retain the alternative's explicit changes in full without retaining replaced details. Example: original "Office chair with armrests", alternative "As item 2.1, but without armrests" → "Office chair without armrests". Do not copy document item references into the description. This changes only the description, not the line_type, quantity or prices.
 - Section headings, title rows without their own quantity and price, and subtotal/total rows are "header".
 - amount is the number in the Qty column. Do not confuse it with item numbers, position numbers (1.1, 2) or tax codes.
 - unit_price is the price per unit as printed; total_price is the line total as printed. If a discount column applies (e.g. -20%), total_price is the discounted total.
 - Shipping, tax and fees that appear only in the totals block go into totals, not into order lines.
 - For the unit, write out abbreviations in plain English ("ea." -> "pieces", "lic." -> "licenses"). Numbers are US-formatted ("1,438.00" = 1438.00); return plain numbers without currency symbols.
+
+ALTERNATIVE DESCRIPTION EXAMPLE
+Original item 2.1: "Sign with a red background and white acrylic lettering."
+Alternative: "As item 2.1, but a blue background. Lettering as described in item 2.1."
+Return position_description: "Sign with a blue background and white acrylic lettering."
+The inherited lettering is named directly, not replaced with "lettering as described in the original item". Apply this same reference resolution to the actual document below.
 
 TOTALS
 - grand_total is the final amount payable on the LAST page (often "Grand total", "Total (gross)", "Total (USD)"). "Carried forward" and "Page subtotal" are not totals.
