@@ -10,12 +10,12 @@ requests across your organization.
 ## Prerequisites
 
 - **Docker Desktop** (or Docker Engine) with **Docker Compose v2** — running before you start.
-- An **OpenAI API key** is optional: the app boots and runs without it; only PDF extraction needs one.
+- An **OpenAI API key** is optional: PDF extraction and AI catalog matching need one; the rest of the app, including direct catalog-name matching, works without it.
 
 ## Quick start (Docker)
 
 ```bash
-cp .env.example .env      # optional: add your OpenAI API key for PDF extraction
+cp .env.example .env      # add OPENAI_API_KEY for extraction and AI catalog matching
 docker compose up --build
 ```
 
@@ -33,17 +33,19 @@ Development happens in the **Acme Corp** organization, which has one of each rol
 | `buyer@acme.com` | buyer | approve requests |
 | `requester@acme.com` | requester | create & track requests |
 
-Every request needs approval by a buyer or admin (see the **Approvals** tab).
+Acme requests below **$2,000**, including tax and shipping, are approved automatically.
+At $2,000 and above, a buyer or admin approves them in the **Approvals** tab.
+Admins can change the limit in Organization → Settings; other tenants have no limit by default.
 
 Other tenants exist to show the multi-tenant setup — **Walmart, Schaeffler,
 Siemens, BMW** — each with an admin at `admin@<company>.com` (same password).
 Their data is fully isolated from Acme's.
 
 On startup the backend applies schema migrations and seeds the database (demo
-accounts, organizations, commodity groups, suppliers) — both steps are
+accounts, organizations, commodity groups, suppliers, articles and Acme settings) — both steps are
 idempotent, so restarts never duplicate or overwrite anything (your data lives
 in the `postgres_data` volume; `docker compose down -v` resets it). The OpenAI
-key is only needed for PDF extraction — everything else works without it.
+key enables PDF extraction and AI catalog matching.
 
 ## Local development
 
@@ -54,11 +56,13 @@ docker compose up db        # Postgres only
 cd backend
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install -e .
+export CORS_ORIGINS=http://localhost:3200
+# Optional: export OPENAI_API_KEY in this shell; Compose reads the root .env itself.
 alembic upgrade head        # schema
 python -m app.seed          # reference data (idempotent)
 uvicorn app.main:app --reload --port 7200
 
-# frontend → http://localhost:3200
+# frontend → http://localhost:3200 (another terminal, from the repository root)
 cd frontend
 npm install
 npm run dev
@@ -66,10 +70,15 @@ npm run dev
 
 ## Tests
 
+Install test tools in the backend environment with `python -m pip install pytest httpx`.
+
 ```bash
-cd backend && python -m pytest      # API tests (in-memory SQLite)
-cd frontend && npx tsc --noEmit && npm run build
+(cd backend && python -m pytest)    # offline tests (in-memory SQLite)
+(cd frontend && npx tsc --noEmit && npm run build)
 ```
+
+The committed backend suite has 74 tests. Quote fixtures and live scorecards are
+local case-study material and are not included; live tests are excluded by default.
 
 ## Layout
 
